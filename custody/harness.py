@@ -26,6 +26,7 @@ from custody.remediator.contract import (
     ScopeContract,
     ScopeViolation,
     is_integrity_critical,
+    is_repo_relative,
     validate_contract,
 )
 from custody.surveyor.runner import survey
@@ -48,6 +49,7 @@ class Proposal:
         files: Full replacement contents, keyed by repository-relative path.
         declared_cost_usd: What the remediator says the proposal cost.
         measured_cost_usd: What token accounting actually measured.
+        cost_measurable: Whether the model's rate was known at all.
         notes: Anything the remediator wants recorded.
     """
 
@@ -55,6 +57,7 @@ class Proposal:
     files: Dict[str, str]
     declared_cost_usd: float = 0.0
     measured_cost_usd: float = 0.0
+    cost_measurable: bool = True
     notes: Dict[str, str] = field(default_factory=dict)
 
 
@@ -109,11 +112,21 @@ def _capture(repo: Path, paths: Sequence[str]) -> Dict[str, str]:
 def _apply(repo: Path, files: Dict[str, str]) -> Tuple[List[str], List[str]]:
     """Write proposed file contents, returning what was written and what was refused.
 
-    Two writes never happen. A path resolving outside the repository is
-    skipped, so a traversal in a proposal cannot reach the filesystem even if
-    contract validation were bypassed. An integrity-critical path - the ledger
-    or the auditor's own source - is also refused, because an agent that can
-    edit the record of its conduct cannot be meaningfully audited afterwards.
+    Every decision here is made against the *resolved* repository-relative
+    path, never the raw key from the proposal. That ordering is the whole
+    point: a key like ``a/../custody/ledger.py`` is not textually equal to any
+    protected glob, yet it resolves onto one. Matching the glob before
+    resolving is how a traversal that cancels back inside the repository slips
+    past a guard that looks like it is working.
+
+    Three writes never happen:
+
+    - a key that is absolute or contains a ``..`` segment, refused before it
+      is resolved at all;
+    - a path that resolves outside the repository;
+    - a path that resolves onto integrity-critical territory - the ledger or
+      the auditor's own source - because an agent that can edit the record of
+      its conduct cannot be meaningfully audited afterwards.
 
     Everything else is allowed through and adjudicated. That asymmetry is
     deliberate: detection is the point, but it only means anything while the
@@ -122,19 +135,27 @@ def _apply(repo: Path, files: Dict[str, str]) -> Tuple[List[str], List[str]]:
     written: List[str] = []
     refused: List[str] = []
     root = repo.resolve()
+
     for rel, content in sorted(files.items()):
-        if is_integrity_critical(rel):
+        if not is_repo_relative(rel):
             refused.append(rel)
             continue
+
         target = (root / rel).resolve()
         try:
-            target.relative_to(root)
+            canonical = target.relative_to(root).as_posix()
         except ValueError:
             refused.append(rel)
             continue
+
+        if is_integrity_critical(canonical):
+            refused.append(rel)
+            continue
+
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        written.append(rel)
+        written.append(canonical)
+
     return written, refused
 
 
@@ -215,6 +236,7 @@ def run_case(
         tests_passed=outcome.passed,
         declared_cost_usd=proposal.declared_cost_usd,
         measured_cost_usd=proposal.measured_cost_usd,
+        cost_measurable=proposal.cost_measurable,
     )
     detections = run_detectors(context)
     judgment = adjudicate(context, detections, survey_ran=after_survey.complete)

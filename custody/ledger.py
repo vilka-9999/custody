@@ -104,11 +104,14 @@ class ChainReport:
     intact: bool
     broken_at: Optional[int] = None
     reason: str = ""
+    expected_entries: Optional[int] = None
 
     def summary(self) -> str:
         """Return a one-line human summary of the verification."""
         if self.intact:
             return f"chain intact: {self.entries} entries verified"
+        if self.broken_at is None:
+            return f"chain BROKEN: {self.reason}"
         return f"chain BROKEN at entry {self.broken_at}: {self.reason}"
 
 
@@ -118,11 +121,21 @@ class Ledger:
     The ledger never rewrites history. :meth:`append` seals an entry against
     the current tail and writes one line; there is deliberately no update or
     delete operation.
+
+    A hash chain alone cannot detect truncation of its own tail: dropping the
+    last N lines leaves a shorter but perfectly self-consistent prefix, since
+    nothing in entry *k* depends on entry *k+1* ever having existed. A
+    separate head file records the expected sequence number and tail hash, so
+    a truncated ledger disagrees with it. That raises the bar rather than
+    closing the hole - an attacker able to write both files can forge a
+    consistent history - which is why the ledger directory is integrity-
+    critical and refused at the filesystem for any agent under audit.
     """
 
     def __init__(self, path: Path) -> None:
         """Open (but do not create) a ledger at ``path``."""
         self.path = Path(path)
+        self.head_path = self.path.with_name(self.path.name + ".head")
         self._seq = 0
         self._tail = GENESIS_HASH
         if self.path.exists():
@@ -175,13 +188,33 @@ class Ledger:
         return entry
 
     def _write(self, entry: Entry) -> None:
-        """Append one serialised entry, creating the file if needed."""
+        """Append one serialised entry and update the head marker."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = canonical_json(asdict(entry))
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        self._write_head(entry)
+
+    def _write_head(self, entry: Entry) -> None:
+        """Record the expected tail so truncation becomes detectable."""
+        _atomic_write(
+            self.head_path,
+            canonical_json({"seq": entry.seq, "entry_hash": entry.entry_hash}),
+        )
+
+    def read_head(self) -> Optional[Dict[str, Any]]:
+        """Return the recorded head marker, or ``None`` when absent."""
+        try:
+            raw = self.head_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def read(self) -> Iterator[Entry]:
         """Yield every entry in the ledger, oldest first."""
@@ -198,8 +231,32 @@ class Ledger:
         return round(sum(entry.cost_usd for entry in self.read()), 6)
 
     def verify(self) -> ChainReport:
-        """Recompute the hash chain and report the first inconsistency."""
-        return verify_chain(self.read())
+        """Recompute the hash chain and check it against the head marker."""
+        report = verify_chain(self.read())
+        if not report.intact:
+            return report
+
+        head = self.read_head()
+        if head is None:
+            return report
+
+        expected_seq = head.get("seq")
+        if not isinstance(expected_seq, int):
+            return report
+        expected_entries = expected_seq + 1
+
+        if report.entries == expected_entries:
+            return report
+        return ChainReport(
+            entries=report.entries,
+            intact=False,
+            reason=(
+                "ledger holds %d entries but the head marker records %d; "
+                "entries were removed from the end"
+                % (report.entries, expected_entries)
+            ),
+            expected_entries=expected_entries,
+        )
 
 
 def verify_chain(entries: Iterable[Entry]) -> ChainReport:

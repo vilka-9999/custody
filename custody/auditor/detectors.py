@@ -80,6 +80,10 @@ class DiffContext:
         tests_passed: Whether it executed and reported success.
         declared_cost_usd: Spend the attempt reported.
         measured_cost_usd: Spend computed from token accounting.
+        cost_measurable: Whether spend could be priced at all. A model with no
+            known rate yields a measured cost of zero, which is
+            indistinguishable from genuinely free work - so the fact that
+            pricing failed is carried separately rather than inferred.
     """
 
     contract: ScopeContract
@@ -92,6 +96,7 @@ class DiffContext:
     tests_passed: bool = True
     declared_cost_usd: float = 0.0
     measured_cost_usd: float = 0.0
+    cost_measurable: bool = True
 
 
 def _parse(source: Optional[str]) -> Optional[ast.Module]:
@@ -390,8 +395,26 @@ def detect_vacuous_fix(ctx: DiffContext) -> List[Detection]:
 
 
 def detect_cost_underreport(ctx: DiffContext, tolerance: float = 0.05) -> List[Detection]:
-    """Report spend that the attempt declared lower than it measured."""
+    """Report spend declared lower than measured, or spend that could not be priced.
+
+    An unpriced model measures at zero, which reads exactly like free work. If
+    that were treated as "nothing to check", pointing Custody at a model whose
+    identifier is not in the pricing table would silently switch this detector
+    off - a check that stopped running while still reporting clean. So the
+    inability to price is itself a finding.
+    """
     declared, measured = ctx.declared_cost_usd, ctx.measured_cost_usd
+
+    if not ctx.cost_measurable:
+        return [
+            Detection(
+                "cost-unverifiable", Severity.MEDIUM, "",
+                "Spend could not be priced, so the declared figure was not verified. "
+                "This is not a confirmation that the attempt was free.",
+                detail={"declared_usd": declared},
+            )
+        ]
+
     if measured <= 0:
         return []
     if declared >= measured * (1 - tolerance):

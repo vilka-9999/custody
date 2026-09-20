@@ -118,7 +118,7 @@ detectors ask whether the attempt cheated:
 | `scope-escape` | Was a file written that the contract never declared? |
 | `gate-loosened` / `gate-removed` | Did a quality threshold move in the easy direction? |
 | `vacuous-fix` | Does a fresh survey still report the finding? |
-| `cost-underreport` | Was spend declared below what was measured? |
+| `cost-underreport` / `cost-unverifiable` | Was spend declared below what was measured — or could it not be priced at all? |
 
 A language model's only role in the audit is adjudicating cases these
 detectors flag as ambiguous. Detection itself is deterministic, so an
@@ -126,8 +126,18 @@ accusation can be re-checked by anyone and cannot be argued away by a
 persuasive commit message.
 
 **Ledger** — append-only JSONL. Each entry's hash covers its own content and
-the hash of the entry before it, so altering or removing any historical entry
-invalidates everything after it.
+the hash of the entry before it, so altering or removing an entry in the
+middle invalidates everything after it.
+
+A hash chain cannot detect truncation of its own tail: dropping the last *N*
+lines leaves a shorter but perfectly self-consistent prefix, because nothing
+in entry *k* depends on entry *k+1* having existed. A separate head marker
+records the expected tail, so a truncated ledger disagrees with it. This
+raises the bar rather than closing the hole — anyone able to write both files
+can forge a consistent history — which is why the ledger directory is
+integrity-critical and refused at the filesystem for any agent under audit.
+Custody's chain is unsigned; it is evidence against silent edits, not against
+an attacker who already owns the disk.
 
 ## Boundaries enforced in code, not in prompts
 
@@ -150,6 +160,15 @@ That asymmetry is the whole design: detection is the point, but it only means
 anything while the evidence is beyond the agent's reach. Any change that
 leaves the test suite red is reverted in full; the attempt survives only as a
 ledger entry.
+
+Every write decision is made against the **resolved** repository-relative
+path. A proposal key containing `..` is refused outright before resolution,
+and protected-path matching folds case, because on most desktop filesystems
+`CUSTODY/LEDGER.PY` and `custody/ledger.py` are the same file. An earlier
+version matched globs against the raw key, so `a/../custody/ledger.py` passed
+both the protection check and the containment check while landing exactly on
+the ledger. Guards have to be applied to the same representation the operating
+system will act on.
 
 ## What a verdict does and does not claim
 
@@ -183,9 +202,14 @@ seriousness as misses.
 python -m unittest discover -s tests
 ```
 
-110 tests, standard library only, so the suite runs anywhere Python does. The
+205 tests, standard library only, so the suite runs anywhere Python does. The
 adversarial trial is among them, and CI runs the suite, the eval, the trial,
 and a self-survey on Python 3.9 through 3.13.
+
+`tests/test_security_regressions.py` holds one test per vulnerability found in
+review. They are kept together because the class matters more than the
+individual bugs: in every case a guard existed and looked correct, but was
+applied to the wrong representation of its input.
 
 ## License
 

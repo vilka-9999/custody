@@ -45,6 +45,10 @@ data and verified by the project's own suite.
 ### Subprocess and input handling
 
 - Every git invocation passes an argument list. No shell is involved anywhere.
+- Write decisions are made against the resolved repository-relative path.
+  Keys containing `..` are refused before resolution; protected-path matching
+  is case-insensitive, so a case variant cannot reach the same file on a
+  case-insensitive filesystem.
 - Refs and branch names are validated against `^[A-Za-z0-9._/\-]{1,255}$`,
   reject `..`, and reject a leading `-` so they cannot be read as options.
 - Proposed paths resolving outside the repository are refused, independently
@@ -59,6 +63,21 @@ ledger, the console, or any commit. The surveyor's secret scanner redacts
 matches before recording them.
 
 The console binds to `127.0.0.1` and is read-only. Do not expose it.
+
+### Known limits
+
+- **The ledger is unsigned.** The hash chain plus head marker detects silent
+  edits, middle deletions, and tail truncation. It does not defend against an
+  attacker with write access to both the ledger and its head marker, who can
+  recompute a consistent alternate history. Protecting that directory from the
+  agent under audit is what the integrity-critical boundary is for.
+- **Analysis is syntactic.** Rules resolve import aliases but not dynamic
+  rebinding (`f = os.system; f(cmd)`). A non-literal `shell=` value is
+  reported as unresolved rather than assumed safe, but the surveyor cannot
+  prove what a runtime value will be.
+- **"The suite is green" is only as strong as the suite.** Custody verifies
+  that a project's own tests pass; it does not assess whether they test
+  anything.
 
 ## Reporting a vulnerability
 

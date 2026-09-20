@@ -82,7 +82,10 @@ def build_prompt(repo: Path, finding: Finding) -> str:
 
 
 def parse_proposal(
-    payload: Dict[str, object], finding: Finding, measured_cost: float
+    payload: Dict[str, object],
+    finding: Finding,
+    measured_cost: float,
+    cost_measurable: bool = True,
 ) -> Proposal:
     """Turn a decoded model response into a :class:`Proposal`.
 
@@ -112,6 +115,7 @@ def parse_proposal(
         files={str(k): str(v) for k, v in files.items()},
         declared_cost_usd=measured_cost,
         measured_cost_usd=measured_cost,
+        cost_measurable=cost_measurable,
     )
 
 
@@ -138,7 +142,9 @@ def propose(
     payload = extract_json(reply.text)
     if payload is None:
         raise ProposalError("model returned no JSON object")
-    return parse_proposal(payload, finding, reply.usage.cost_usd)
+    return parse_proposal(
+        payload, finding, reply.usage.cost_usd, cost_measurable=reply.usage.priced
+    )
 
 
 def available(key: Optional[str] = None) -> bool:

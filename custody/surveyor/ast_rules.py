@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from custody.findings import Finding, Pillar, Severity, finding_id, sort_findings
 
@@ -26,6 +26,25 @@ DANGEROUS_ATTRIBUTES = {
     ("os", "system"): (Severity.HIGH, "os.system() passes a string to a shell"),
     ("marshal", "loads"): (Severity.HIGH, "marshal.loads() is unsafe on untrusted input"),
 }
+
+SUBPROCESS_CALLS = frozenset(
+    {
+        "subprocess.run",
+        "subprocess.Popen",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
+    }
+)
+"""Calls whose ``shell`` keyword decides whether a shell interprets the command.
+
+The shell rules apply only to these. An earlier version inspected every call
+that spread keyword arguments, which flagged ordinary constructor calls like
+``DiffContext(**base)`` seventeen times in this repository alone. A detector
+that fires on everything tells you nothing.
+"""
 
 MAX_COMPLEXITY = 10
 """Cyclomatic complexity above which a function is reported."""
@@ -60,6 +79,41 @@ def _excerpt(path: Path, line: int) -> str:
     return lines[line - 1].strip() if 0 < line <= len(lines) else ""
 
 
+def import_aliases(tree: ast.Module) -> Dict[str, str]:
+    """Map local names to the dotted names they were imported from.
+
+    ``import os as o`` maps ``o`` to ``os``; ``from os import system as run``
+    maps ``run`` to ``os.system``. Without this, renaming an import hides a
+    dangerous call from every rule below - and a remediator could "fix" a
+    finding by aliasing the import rather than removing the call, which the
+    auditor would then see as legitimately resolved.
+
+    Only module-level and nested import statements are tracked. Dynamic
+    rebinding (``f = os.system``) is not resolved, and is a known gap.
+    """
+    aliases: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                local = alias.asname or alias.name
+                aliases[local] = "%s.%s" % (node.module, alias.name)
+    return aliases
+
+
+def _resolve(name: str, aliases: Dict[str, str]) -> str:
+    """Return ``name`` with its leading segment expanded through ``aliases``."""
+    if not name:
+        return name
+    head, _, rest = name.partition(".")
+    target = aliases.get(head)
+    if target is None:
+        return name
+    return "%s.%s" % (target, rest) if rest else target
+
+
 def _call_name(node: ast.Call) -> str:
     """Return a dotted name for a call target, e.g. ``os.system``."""
     func = node.func
@@ -73,41 +127,105 @@ def _call_name(node: ast.Call) -> str:
 
 
 def rule_shell_true(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
-    """Report subprocess calls that hand a command string to a shell."""
+    """Report subprocess calls that may hand a command to a shell.
+
+    A literal ``shell=True`` is reported outright. A non-literal value -
+    ``shell=flag``, or a ``**kwargs`` spread that could carry one - is
+    reported at lower severity rather than ignored: the rule cannot prove a
+    shell is involved, and saying nothing would be indistinguishable from
+    having checked and found it safe.
+    """
     found: List[Finding] = []
+    aliases = import_aliases(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
+        if _resolve(_call_name(node), aliases) not in SUBPROCESS_CALLS:
+            continue
         for keyword in node.keywords:
-            is_shell = keyword.arg == "shell"
+            if keyword.arg is None:
+                if _spread_may_carry_shell(keyword.value):
+                    found.append(
+                        _shell_finding(
+                            rel, node.lineno, path, "subprocess-shell-unresolved",
+                            Severity.MEDIUM,
+                            "Subprocess call spreads keyword arguments; a shell "
+                            "cannot be ruled out here.",
+                        )
+                    )
+                continue
+            if keyword.arg != "shell":
+                continue
             value = keyword.value
-            if is_shell and isinstance(value, ast.Constant) and value.value is True:
+            if isinstance(value, ast.Constant):
+                if value.value is True:
+                    found.append(
+                        _shell_finding(
+                            rel, node.lineno, path, "subprocess-shell-true",
+                            Severity.CRITICAL,
+                            "Subprocess call uses shell=True; pass an argument "
+                            "list instead.",
+                        )
+                    )
+            else:
                 found.append(
-                    Finding(
-                        id=finding_id("subprocess-shell-true", rel, node.lineno),
-                        rule="subprocess-shell-true",
-                        pillar=Pillar.SECURITY,
-                        severity=Severity.CRITICAL,
-                        path=rel,
-                        line=node.lineno,
-                        message="Subprocess call uses shell=True; pass an argument list instead.",
-                        evidence=_excerpt(path, node.lineno),
+                    _shell_finding(
+                        rel, node.lineno, path, "subprocess-shell-unresolved",
+                        Severity.MEDIUM,
+                        "Subprocess call sets shell to a non-literal value; "
+                        "whether a shell runs cannot be determined here.",
                     )
                 )
     return found
 
 
+def _shell_finding(
+    rel: str, line: int, path: Path, rule: str, severity: Severity, message: str
+) -> Finding:
+    """Build one shell-related finding."""
+    return Finding(
+        id=finding_id(rule, rel, line),
+        rule=rule,
+        pillar=Pillar.SECURITY,
+        severity=severity,
+        path=rel,
+        line=line,
+        message=message,
+        evidence=_excerpt(path, line),
+    )
+
+
+def _spread_may_carry_shell(value: ast.AST) -> bool:
+    """Return whether a ``**`` spread could introduce a shell keyword.
+
+    A literal dict is inspected directly; anything else is unknowable from
+    the syntax tree alone and is treated as possible.
+    """
+    if isinstance(value, ast.Dict):
+        for key in value.keys:
+            if isinstance(key, ast.Constant) and key.value == "shell":
+                return True
+        return False
+    return True
+
+
 def rule_dangerous_calls(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
-    """Report calls to builtins and stdlib functions that execute input."""
+    """Report calls to builtins and stdlib functions that execute input.
+
+    Call targets are resolved through the module's import aliases first, so
+    ``import os as o; o.system(x)`` is reported exactly like ``os.system(x)``.
+    """
     found: List[Finding] = []
+    aliases = import_aliases(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        name = _call_name(node)
-        severity_message = DANGEROUS_CALLS.get(name)
+        raw = _call_name(node)
+        name = _resolve(raw, aliases)
+        severity_message = DANGEROUS_CALLS.get(name) or DANGEROUS_CALLS.get(raw)
         if severity_message is None and "." in name:
-            module, _, attr = name.partition(".")
-            severity_message = DANGEROUS_ATTRIBUTES.get((module, attr))
+            module, _, attr = name.rpartition(".")
+            severity_message = DANGEROUS_ATTRIBUTES.get((module.split(".")[-1], attr))
         if severity_message is None:
             continue
         severity, message = severity_message

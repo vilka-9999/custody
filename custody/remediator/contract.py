@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fnmatch
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Dict, Iterable, List, Sequence
 
 PROTECTED_GLOBS: List[str] = [
@@ -98,13 +99,52 @@ class ScopeContract:
         }
 
 
-def is_protected(path: str, protected: Sequence[str] = tuple(PROTECTED_GLOBS)) -> bool:
-    """Return whether ``path`` falls under any protected glob."""
+def is_repo_relative(path: str) -> bool:
+    """Return whether ``path`` is a plain path inside a repository.
+
+    Rejects absolute paths, Windows drive letters, and any ``..`` segment.
+    A path containing ``..`` may still land inside the repository once
+    resolved, so this is a syntactic filter applied before resolution, not a
+    substitute for it.
+    """
+    candidate = path.replace("\\", "/")
+    if not candidate or candidate.startswith("/") or candidate.startswith("~"):
+        return False
+    if len(candidate) > 1 and candidate[1] == ":":
+        return False
+    return ".." not in PurePosixPath(candidate).parts
+
+
+def normalise(path: str) -> str:
+    """Return ``path`` in the form protection globs are matched against.
+
+    Separators are unified, ``./`` prefixes dropped, and the result lowercased.
+    Case folding matters because most desktop filesystems are case-insensitive:
+    on them ``CUSTODY/LEDGER.PY`` and ``custody/ledger.py`` are the same file,
+    and a case-sensitive glob would refuse one while permitting the other.
+
+    This can only over-match, never under-match. Refusing a write that was
+    actually harmless costs an attempt; permitting one that was not costs the
+    integrity of the audit.
+    """
     normalised = path.replace("\\", "/")
     while normalised.startswith("./"):
         normalised = normalised[2:]
-    for pattern in protected:
-        if fnmatch.fnmatch(normalised, pattern):
+    return normalised.lower()
+
+
+def is_protected(path: str, protected: Sequence[str] = tuple(PROTECTED_GLOBS)) -> bool:
+    """Return whether ``path`` falls under any protected glob.
+
+    ``path`` must already be repository-relative and free of ``..`` segments.
+    Callers handling untrusted input resolve the path against the repository
+    root first - matching a glob against an unresolved string is how a
+    traversal that cancels back onto a protected file slips through.
+    """
+    normalised = normalise(path)
+    for raw in protected:
+        pattern = normalise(raw)
+        if fnmatch.fnmatchcase(normalised, pattern):
             return True
         if pattern.endswith("/**") and normalised.startswith(pattern[:-2]):
             return True
@@ -133,7 +173,7 @@ def validate_contract(
             % (len(contract.allowed_paths), MAX_DECLARED_PATHS)
         )
     for path in contract.allowed_paths:
-        if path.startswith("/") or ".." in path:
+        if not is_repo_relative(path):
             raise ScopeViolation("path escapes the repository: %s" % path)
         if is_protected(path, protected):
             raise ScopeViolation("path is protected and may not be declared: %s" % path)
