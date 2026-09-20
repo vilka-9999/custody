@@ -91,9 +91,30 @@ def head_sha(repo: Path) -> str:
     return require_git(repo, ["rev-parse", "HEAD"]).strip()
 
 
-def is_clean(repo: Path) -> bool:
-    """Return whether the working tree has no uncommitted changes."""
-    return not require_git(repo, ["status", "--porcelain"]).strip()
+def is_clean(repo: Path, ignore: Sequence[str] = (".custody",)) -> bool:
+    """Return whether the working tree has no uncommitted changes.
+
+    Paths under ``ignore`` do not count. Custody writes its ledger inside the
+    repository it is auditing, and its own artifact must not be mistaken for
+    the operator's uncommitted work - otherwise merely surveying a repository
+    would make it ineligible to be hardened.
+    """
+    return not dirty_paths(repo, ignore)
+
+
+def dirty_paths(repo: Path, ignore: Sequence[str] = (".custody",)) -> List[str]:
+    """Return the uncommitted paths that are not excluded by ``ignore``."""
+    prefixes = tuple(p.rstrip("/") + "/" for p in ignore)
+    names = tuple(p.rstrip("/") for p in ignore)
+    found: List[str] = []
+    for line in require_git(repo, ["status", "--porcelain"]).splitlines():
+        entry = line[3:].strip().strip('"')
+        if not entry:
+            continue
+        if entry.startswith(prefixes) or entry in names:
+            continue
+        found.append(entry)
+    return found
 
 
 def changed_files(repo: Path, base: str = "HEAD") -> List[str]:
@@ -126,9 +147,15 @@ def create_branch(repo: Path, name: str) -> None:
     require_git(repo, ["checkout", "-b", name])
 
 
-def commit_all(repo: Path, message: str) -> str:
-    """Stage every change and commit it, returning the new SHA."""
-    require_git(repo, ["add", "-A"])
+def commit_all(repo: Path, message: str, exclude: Sequence[str] = (".custody",)) -> str:
+    """Stage every change and commit it, returning the new SHA.
+
+    Custody's own ledger lives inside the repository but is not part of the
+    work being committed, so it is excluded from the index. A tool that writes
+    its own bookkeeping into the subject's history has changed the subject.
+    """
+    pathspec = ["."] + [":(exclude)%s" % pattern for pattern in exclude]
+    require_git(repo, ["add", "-A", "--", *pathspec])
     result = run_git(repo, ["commit", "-m", message])
     if not result.ok and "nothing to commit" in (result.stdout + result.stderr):
         raise GitError("nothing to commit")

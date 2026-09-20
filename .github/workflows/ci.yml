@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Configure git
+        run: |
+          git config --global user.email "ci@custody.local"
+          git config --global user.name "Custody CI"
+      - name: Run the test suite
+        run: python -m unittest discover -s tests -q
+      - name: Score the auditor on ground-truth fixtures
+        run: python -m custody eval
+      - name: Run the adversarial trial
+        run: python -m custody trial
+      - name: Custody surveys itself
+        run: python -m custody survey .
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dev tooling
+        run: pip install ruff==0.6.9 mypy==1.11.2
+      - name: Lint
+        run: ruff check custody tests
+      - name: Type check
+        run: mypy custody

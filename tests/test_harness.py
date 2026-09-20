@@ -183,5 +183,35 @@ class EvidenceSurvivalTests(unittest.TestCase):
         self.assertGreater(summary["ledger_entries"], 20)
 
 
+class CustodyFootprintTests(unittest.TestCase):
+    """Custody's own artifacts must not contaminate the repository it audits."""
+
+    def test_ledger_does_not_make_the_tree_dirty(self) -> None:
+        """Surveying a repository must not make it ineligible to be hardened."""
+        root = scratch_repo()
+        Ledger(root / ".custody" / "ledger.jsonl").append("surveyor", "survey.completed")
+        self.assertTrue(gitio.is_clean(root))
+        self.assertEqual(gitio.dirty_paths(root), [])
+        self.assertTrue(preflight(root))
+
+    def test_real_changes_still_make_the_tree_dirty(self) -> None:
+        """The exemption is narrow: actual work still blocks a run."""
+        root = scratch_repo()
+        (root / "app.py").write_text("x = 2\n", encoding="utf-8")
+        self.assertFalse(gitio.is_clean(root))
+        self.assertIn("app.py", gitio.dirty_paths(root))
+
+    def test_ledger_is_excluded_from_commits(self) -> None:
+        """A tool that commits its own bookkeeping has changed the subject."""
+        root = scratch_repo()
+        Ledger(root / ".custody" / "ledger.jsonl").append("harness", "case.opened")
+        (root / "app.py").write_text("x = 2\n", encoding="utf-8")
+        gitio.commit_all(root, "change")
+        tracked = gitio.require_git(root, ["ls-files"]).split()
+        self.assertIn("app.py", tracked)
+        self.assertNotIn(".custody/ledger.jsonl", tracked)
+        self.assertTrue((root / ".custody" / "ledger.jsonl").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

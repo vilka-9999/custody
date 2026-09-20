@@ -20,12 +20,52 @@ No third-party runtime dependencies. Python 3.9 or newer.
 python -m custody survey .
 ```
 
+## Two remediators
+
+`custody harden` runs the same loop either way; only the proposer changes.
+
+**Deterministic** (`--offline`, the default when no API key is set) applies
+rule-based fixes: dropping `shell=True`, narrowing a bare `except:`, adding a
+missing docstring. It declines anything it cannot repair correctly — a
+`shell=True` whose first argument is a command *string* is left alone, because
+rewriting it into a list is a semantic change no fixer should guess at.
+
+**Model-backed** (`--model claude-opus-5`) asks Claude for a bounded proposal.
+Cost is taken from token accounting, never from what the agent says it spent.
+
+Neither is trusted because of what it is. Both go through the same contract,
+the same test gate, and the same adjudication.
+
+```
+$ custody harden ./project --limit 10
+
+  CUS-C1491106  subprocess-shell-true    toolkit.py:5
+    PROVEN     The finding is gone from a fresh survey, the suite is green,
+               and every file written was declared.
+  CUS-326B2C98  bare-except              toolkit.py:12
+    PROVEN     ...
+  CUS-F5A800EC  missing-annotations      toolkit.py:4
+    declined (no fixer for this rule)
+
+  4 adjudicated, 5 declined, over 9 attempt(s)
+  findings 9 -> 5
+  committed              4
+  ledger entries         34
+  ledger recorded        True
+```
+
+The queue is re-derived before every attempt. A committed fix shifts the line
+numbers of everything below it in the same file, so a list surveyed once goes
+stale after the first commit — and a fixer acting on a stale location either
+edits the wrong line or silently declines. Re-surveying costs milliseconds and
+keeps every location true at the moment it is acted on.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `custody survey [repo]` | Deterministic analysis: dangerous sinks, committed secrets, complexity, missing types and docs. Same input, same output, every time. |
-| `custody harden [repo]` | The full loop: propose under contract, apply, run the suite, re-survey, adjudicate, keep or revert. Needs `ANTHROPIC_API_KEY`. |
+| `custody harden [repo]` | The full loop: propose under contract, apply, run the suite, re-survey, adjudicate, keep or revert. |
 | `custody trial` | The adversarial trial. Runs offline, needs no key. |
 | `custody verify [repo]` | Recomputes the ledger hash chain and reports the first entry that does not reconcile. |
 | `custody eval` | Scores the auditor against twelve fixtures with known answers. |
@@ -143,8 +183,9 @@ seriousness as misses.
 python -m unittest discover -s tests
 ```
 
-87 tests, standard library only, so the suite runs anywhere Python does. The
-adversarial trial is among them.
+110 tests, standard library only, so the suite runs anywhere Python does. The
+adversarial trial is among them, and CI runs the suite, the eval, the trial,
+and a self-survey on Python 3.9 through 3.13.
 
 ## License
 

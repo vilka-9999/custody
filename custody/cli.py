@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from custody import __version__, gitio
 from custody.findings import Finding, sort_findings
@@ -94,17 +94,46 @@ def cmd_console(args: argparse.Namespace) -> int:
     return 0
 
 
+def _key(finding: Finding) -> tuple:
+    """Return an identity for a finding that survives line-number drift.
+
+    A finding's id is derived from its location, so committing a fix above it
+    changes the id of everything below. Keying on the symbol when one is known
+    keeps "already attempted" meaningful across a re-survey.
+    """
+    symbol = finding.detail.get("symbol") or finding.detail.get("function")
+    return (finding.rule, finding.path, symbol or finding.line)
+
+
+def _select_remediator(args: argparse.Namespace) -> Tuple[str, Callable]:
+    """Choose a remediator and return its name alongside a proposal function.
+
+    Falling back to the deterministic remediator when no key is present is a
+    reduction in capability, not a failure, so it is announced rather than
+    silently substituted.
+    """
+    from custody.remediator import deterministic
+    from custody.remediator.agent import available, propose as llm_propose
+
+    if args.offline or not available():
+        if not args.offline:
+            print("ANTHROPIC_API_KEY is not set; using the deterministic remediator.")
+            print("It fixes a subset of rules and declines the rest.")
+        return "deterministic", lambda repo, finding: deterministic.propose(repo, finding)
+
+    return "model:%s" % args.model, lambda repo, finding: llm_propose(
+        repo, finding, model=args.model, effort=args.effort
+    )
+
+
 def cmd_harden(args: argparse.Namespace) -> int:
     """Run the full loop: propose under contract, verify, adjudicate, keep or revert."""
     from custody.harness import HarnessRefusal, preflight, run_case, summarise_run
     from custody.llm import LLMError
-    from custody.remediator.agent import ProposalError, available, propose
+    from custody.remediator.agent import ProposalError
 
     repo = Path(args.repo)
-    if not available():
-        print("ANTHROPIC_API_KEY is not set.")
-        print("Run 'custody trial' for the offline adversarial demonstration instead.")
-        return 1
+    remediator_name, make_proposal = _select_remediator(args)
 
     try:
         base_sha = preflight(repo, allow_default_branch=args.allow_default_branch)
@@ -117,8 +146,7 @@ def cmd_harden(args: argparse.Namespace) -> int:
         print("survey did not complete; refusing to act on partial evidence")
         return 1
 
-    findings = sort_findings(result.findings)[: args.limit]
-    if not findings:
+    if not result.findings:
         print(result.summary())
         print("nothing to remediate")
         return 0
@@ -127,42 +155,84 @@ def cmd_harden(args: argparse.Namespace) -> int:
     ledger.append(
         "harness", "run.started", target=str(repo),
         detail={"base_sha": base_sha, "branch": gitio.current_branch(repo),
-                "queued": len(findings), "model": args.model},
+                "findings_at_start": len(result.findings), "limit": args.limit,
+                "remediator": remediator_name, "dry_run": bool(args.dry_run)},
     )
-    print("Custody harden: %d finding(s) queued on branch %s"
-          % (len(findings), gitio.current_branch(repo)))
+    print("Custody harden: up to %d attempt(s) on branch %s via %s"
+          % (args.limit, gitio.current_branch(repo), remediator_name))
+    if args.dry_run:
+        print("dry run: nothing will be committed")
     print("")
 
     results = []
-    for finding in findings:
-        print("  %s  %s" % (finding.id, finding.location()))
+    declined = 0
+    attempted: set = set()
+    attempts = 0
+
+    # The queue is re-derived before every attempt. A committed fix shifts the
+    # line numbers of everything below it in the same file, so a list surveyed
+    # once goes stale after the first commit and later findings silently point
+    # at the wrong lines. Re-surveying costs a few milliseconds and keeps every
+    # location true at the moment it is acted on.
+    while attempts < args.limit:
+        current = survey(repo)
+        if not current.complete:
+            print("survey did not complete mid-run; stopping rather than guessing")
+            break
+        pending = [f for f in sort_findings(current.findings) if _key(f) not in attempted]
+        if not pending:
+            break
+
+        finding = pending[0]
+        attempted.add(_key(finding))
+        attempts += 1
+        base_for_case = gitio.head_sha(repo)
+        print("  %s  %-34s %s" % (finding.id, finding.rule, finding.location()))
+
         try:
-            proposal = propose(repo, finding, model=args.model, effort=args.effort)
+            proposal = make_proposal(repo, finding)
         except (ProposalError, LLMError) as exc:
             ledger.append(
                 "remediator", "proposal.failed", target=finding.id,
-                detail={"error": str(exc)},
+                detail={"error": str(exc), "rule": finding.rule},
             )
             print("    proposal failed: %s" % exc)
             continue
+        if proposal is None:
+            declined += 1
+            ledger.append(
+                "remediator", "proposal.declined", target=finding.id,
+                detail={"reason": "no fixer available for this rule", "rule": finding.rule},
+            )
+            print("    declined (no fixer for this rule)")
+            continue
+
         case = run_case(
-            repo, finding, proposal, ledger, base_sha, result.findings,
+            repo, finding, proposal, ledger, base_for_case, current.findings,
             commit=not args.dry_run,
         )
         results.append(case)
         detectors = sorted({d.detector for d in case.judgment.detections})
         print("    %-22s %s" % (
-            case.judgment.ruling.value, ", ".join(detectors) or "no detections"
+            case.judgment.ruling.value, ", ".join(detectors) or case.judgment.reason
         ))
 
     summary = summarise_run(results, ledger)
+    summary["declined"] = declined
+    summary["attempts"] = attempts
+    summary["findings_at_start"] = len(result.findings)
+    summary["findings_now"] = len(survey(repo).findings)
     ledger.append("harness", "run.finished", target=str(repo), detail=summary)
     print("")
+    print("  %d adjudicated, %d declined, over %d attempt(s)"
+          % (len(results), declined, attempts))
+    print("  findings %d -> %d" % (summary["findings_at_start"], summary["findings_now"]))
     for ruling, count in sorted(summary["rulings"].items()):
         print("  %-22s %d" % (ruling, count))
     print("  committed              %d" % summary["committed"])
     print("  spend                  $%.4f" % summary["spend_usd"])
-    print("  ledger intact          %s" % summary["ledger_intact"])
+    print("  ledger entries         %d" % summary["ledger_entries"])
+    print("  ledger recorded        %s" % summary["ledger_recorded"])
     return 0
 
 
@@ -209,6 +279,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     harden_parser.add_argument(
         "--dry-run", action="store_true", help="adjudicate but never commit"
+    )
+    harden_parser.add_argument(
+        "--offline", action="store_true",
+        help="use the deterministic remediator; no API key, no network",
     )
     harden_parser.add_argument(
         "--allow-default-branch", action="store_true",

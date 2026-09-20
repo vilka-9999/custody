@@ -79,9 +79,11 @@ def preflight(repo: Path, allow_default_branch: bool = False) -> str:
     repo = Path(repo)
     if not gitio.is_repo(repo):
         raise HarnessRefusal("%s is not a git repository" % repo)
-    if not gitio.is_clean(repo):
+    dirty = gitio.dirty_paths(repo)
+    if dirty:
         raise HarnessRefusal(
-            "working tree has uncommitted changes; commit or stash them first"
+            "working tree has uncommitted changes (%s); commit or stash them first"
+            % ", ".join(dirty[:4])
         )
     branch = gitio.current_branch(repo)
     if branch in PROTECTED_BRANCHES and not allow_default_branch:
