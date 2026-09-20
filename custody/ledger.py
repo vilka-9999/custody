@@ -16,10 +16,11 @@ import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any
 
 GENESIS_HASH = "0" * 64
 """Hash that precedes the first entry in a chain."""
@@ -27,12 +28,22 @@ GENESIS_HASH = "0" * 64
 _HASH_FIELD = "entry_hash"
 
 
+class LedgerError(RuntimeError):
+    """Raised when a ledger file cannot be read as a ledger at all.
+
+    A line that is not valid JSON, or not a valid entry, is tampering or
+    corruption - either way the chain cannot be pronounced intact. Raising a
+    typed error lets ``verify`` report a broken chain instead of crashing
+    with a traceback that says nothing about custody.
+    """
+
+
 def _utc_now() -> str:
     """Return the current UTC time as an ISO-8601 string with a Z suffix."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def canonical_json(payload: Dict[str, Any]) -> str:
+def canonical_json(payload: dict[str, Any]) -> str:
     """Serialise ``payload`` deterministically.
 
     Key order, separators and unicode handling are all pinned so that the same
@@ -72,8 +83,8 @@ class Entry:
     actor: str
     action: str
     target: str = ""
-    detail: Dict[str, Any] = field(default_factory=dict)
-    files_touched: List[str] = field(default_factory=list)
+    detail: dict[str, Any] = field(default_factory=dict)
+    files_touched: list[str] = field(default_factory=list)
     tokens_in: int = 0
     tokens_out: int = 0
     cost_usd: float = 0.0
@@ -81,7 +92,7 @@ class Entry:
     prev_hash: str = GENESIS_HASH
     entry_hash: str = ""
 
-    def body(self) -> Dict[str, Any]:
+    def body(self) -> dict[str, Any]:
         """Return every field except the entry's own hash."""
         return {f.name: getattr(self, f.name) for f in fields(self) if f.name != _HASH_FIELD}
 
@@ -89,7 +100,7 @@ class Entry:
         """Derive this entry's hash from its body and its predecessor."""
         return digest(canonical_json(self.body()))
 
-    def sealed(self) -> "Entry":
+    def sealed(self) -> Entry:
         """Return a copy of this entry with ``entry_hash`` filled in."""
         data = asdict(self)
         data[_HASH_FIELD] = self.compute_hash()
@@ -102,9 +113,9 @@ class ChainReport:
 
     entries: int
     intact: bool
-    broken_at: Optional[int] = None
+    broken_at: int | None = None
     reason: str = ""
-    expected_entries: Optional[int] = None
+    expected_entries: int | None = None
 
     def summary(self) -> str:
         """Return a one-line human summary of the verification."""
@@ -143,9 +154,9 @@ class Ledger:
 
     def _resume(self) -> None:
         """Restore sequence and tail hash from an existing file."""
-        last: Optional[Entry] = None
-        for last in self.read():
-            pass
+        last: Entry | None = None
+        for entry in self.read():
+            last = entry
         if last is not None:
             self._seq = last.seq + 1
             self._tail = last.entry_hash
@@ -160,8 +171,8 @@ class Ledger:
         actor: str,
         action: str,
         target: str = "",
-        detail: Optional[Dict[str, Any]] = None,
-        files_touched: Optional[Iterable[str]] = None,
+        detail: dict[str, Any] | None = None,
+        files_touched: Iterable[str] | None = None,
         tokens_in: int = 0,
         tokens_out: int = 0,
         cost_usd: float = 0.0,
@@ -204,7 +215,7 @@ class Ledger:
             canonical_json({"seq": entry.seq, "entry_hash": entry.entry_hash}),
         )
 
-    def read_head(self) -> Optional[Dict[str, Any]]:
+    def read_head(self) -> dict[str, Any] | None:
         """Return the recorded head marker, or ``None`` when absent."""
         try:
             raw = self.head_path.read_text(encoding="utf-8")
@@ -217,14 +228,25 @@ class Ledger:
         return parsed if isinstance(parsed, dict) else None
 
     def read(self) -> Iterator[Entry]:
-        """Yield every entry in the ledger, oldest first."""
+        """Yield every entry in the ledger, oldest first.
+
+        Raises:
+            LedgerError: If a line is not a well-formed entry. Malformed
+                content is a broken record, not something to skip past.
+        """
         if not self.path.exists():
             return
         with self.path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
+            for lineno, raw in enumerate(handle, start=1):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
                     yield Entry(**json.loads(line))
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise LedgerError(
+                        f"entry at line {lineno} is not a well-formed ledger entry: {exc}"
+                    ) from exc
 
     def total_cost(self) -> float:
         """Return the summed model spend recorded in the ledger."""
@@ -232,31 +254,65 @@ class Ledger:
 
     def verify(self) -> ChainReport:
         """Recompute the hash chain and check it against the head marker."""
-        report = verify_chain(self.read())
+        try:
+            entries = list(self.read())
+        except LedgerError as exc:
+            return ChainReport(entries=0, intact=False, reason=str(exc))
+        report = verify_chain(entries)
         if not report.intact:
             return report
 
         head = self.read_head()
         if head is None:
-            return report
+            # A ledger with entries but no marker cannot rule out truncation:
+            # dropping the tail *and* the marker file leaves a perfectly
+            # self-consistent prefix. An earlier version accepted that as
+            # intact, which made deleting one extra file a complete bypass of
+            # the truncation check.
+            if report.entries == 0:
+                return report
+            return ChainReport(
+                entries=report.entries,
+                intact=False,
+                reason=(
+                    "ledger holds %d entries but its head marker is missing; "
+                    "truncation cannot be ruled out" % report.entries
+                ),
+            )
 
         expected_seq = head.get("seq")
+        expected_hash = head.get("entry_hash")
         if not isinstance(expected_seq, int):
-            return report
+            return ChainReport(
+                entries=report.entries, intact=False,
+                reason="head marker is malformed; it does not record a sequence number",
+            )
         expected_entries = expected_seq + 1
 
-        if report.entries == expected_entries:
-            return report
-        return ChainReport(
-            entries=report.entries,
-            intact=False,
-            reason=(
-                "ledger holds %d entries but the head marker records %d; "
-                "entries were removed from the end"
-                % (report.entries, expected_entries)
-            ),
-            expected_entries=expected_entries,
-        )
+        if report.entries != expected_entries:
+            return ChainReport(
+                entries=report.entries,
+                intact=False,
+                reason=(
+                    "ledger holds %d entries but the head marker records %d; "
+                    "entries were removed from the end"
+                    % (report.entries, expected_entries)
+                ),
+                expected_entries=expected_entries,
+            )
+
+        tail_hash = entries[-1].entry_hash if entries else GENESIS_HASH
+        if isinstance(expected_hash, str) and expected_hash != tail_hash:
+            return ChainReport(
+                entries=report.entries,
+                intact=False,
+                reason=(
+                    "the head marker does not match the final entry's seal; "
+                    "the tail was rewritten"
+                ),
+                expected_entries=expected_entries,
+            )
+        return report
 
 
 def verify_chain(entries: Iterable[Entry]) -> ChainReport:
@@ -268,10 +324,9 @@ def verify_chain(entries: Iterable[Entry]) -> ChainReport:
     over the entry's body.
     """
     expected_prev = GENESIS_HASH
-    expected_seq = 0
     count = 0
 
-    for entry in entries:
+    for expected_seq, entry in enumerate(entries):
         if entry.seq != expected_seq:
             return ChainReport(count, False, entry.seq, f"expected seq {expected_seq}")
         if entry.prev_hash != expected_prev:
@@ -279,13 +334,12 @@ def verify_chain(entries: Iterable[Entry]) -> ChainReport:
         if entry.entry_hash != entry.compute_hash():
             return ChainReport(count, False, entry.seq, "entry content does not match its seal")
         expected_prev = entry.entry_hash
-        expected_seq += 1
         count += 1
 
     return ChainReport(count, True)
 
 
-def load(path: Path) -> List[Entry]:
+def load(path: Path) -> list[Entry]:
     """Read every entry from the ledger file at ``path``."""
     return list(Ledger(path).read())
 
@@ -302,4 +356,4 @@ def _atomic_write(path: Path, text: str) -> None:
         os.fsync(handle.fileno())
     finally:
         handle.close()
-    os.replace(handle.name, path)
+    Path(handle.name).replace(path)

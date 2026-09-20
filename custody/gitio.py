@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
 
 SAFE_REF = re.compile(r"^[A-Za-z0-9._/\-]{1,255}$")
 """Refs and branch names must match this to be passed to git."""
@@ -45,7 +45,7 @@ def validate_ref(ref: str) -> str:
     are untrusted input even though they are not user-facing.
     """
     if not SAFE_REF.match(ref) or ".." in ref or ref.startswith("-"):
-        raise GitError("unsafe git ref: %r" % (ref,))
+        raise GitError(f"unsafe git ref: {ref!r}")
     return ref
 
 
@@ -64,7 +64,7 @@ def run_git(repo: Path, args: Sequence[str], timeout: int = DEFAULT_TIMEOUT) -> 
     except FileNotFoundError as exc:
         raise GitError("git is not installed or not on PATH") from exc
     except subprocess.TimeoutExpired as exc:
-        raise GitError("git %s timed out after %ss" % (" ".join(args), timeout)) from exc
+        raise GitError("git {} timed out after {}s".format(" ".join(args), timeout)) from exc
     return GitResult(completed.returncode, completed.stdout, completed.stderr)
 
 
@@ -72,7 +72,7 @@ def require_git(repo: Path, args: Sequence[str]) -> str:
     """Run git and return stdout, raising :class:`GitError` on failure."""
     result = run_git(repo, args)
     if not result.ok:
-        raise GitError("git %s failed: %s" % (" ".join(args), result.stderr.strip()))
+        raise GitError("git {} failed: {}".format(" ".join(args), result.stderr.strip()))
     return result.stdout
 
 
@@ -102,11 +102,11 @@ def is_clean(repo: Path, ignore: Sequence[str] = (".custody",)) -> bool:
     return not dirty_paths(repo, ignore)
 
 
-def dirty_paths(repo: Path, ignore: Sequence[str] = (".custody",)) -> List[str]:
+def dirty_paths(repo: Path, ignore: Sequence[str] = (".custody",)) -> list[str]:
     """Return the uncommitted paths that are not excluded by ``ignore``."""
     prefixes = tuple(p.rstrip("/") + "/" for p in ignore)
     names = tuple(p.rstrip("/") for p in ignore)
-    found: List[str] = []
+    found: list[str] = []
     for line in require_git(repo, ["status", "--porcelain"]).splitlines():
         entry = line[3:].strip().strip('"')
         if not entry:
@@ -117,15 +117,20 @@ def dirty_paths(repo: Path, ignore: Sequence[str] = (".custody",)) -> List[str]:
     return found
 
 
-def changed_files(repo: Path, base: str = "HEAD") -> List[str]:
-    """Return paths that differ from ``base``, including untracked files."""
+def changed_files(repo: Path, base: str = "HEAD") -> list[str]:
+    """Return paths that differ from ``base``, including untracked files.
+
+    Output is NUL-delimited (``-z``), never whitespace-split: a path with a
+    space in it would otherwise fragment into two phantom paths, and the
+    auditor's before/after capture would read the wrong files.
+    """
     validate_ref(base)
-    tracked = require_git(repo, ["diff", "--name-only", base]).split()
-    untracked = require_git(repo, ["ls-files", "--others", "--exclude-standard"]).split()
-    return sorted(set(tracked) | set(untracked))
+    tracked = require_git(repo, ["diff", "--name-only", "-z", base]).split("\0")
+    untracked = require_git(repo, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\0")
+    return sorted({path for path in (*tracked, *untracked) if path})
 
 
-def diff(repo: Path, base: str = "HEAD", path: Optional[str] = None) -> str:
+def diff(repo: Path, base: str = "HEAD", path: str | None = None) -> str:
     """Return a unified diff against ``base``, optionally limited to ``path``."""
     validate_ref(base)
     args = ["diff", "--unified=3", base]
@@ -134,10 +139,10 @@ def diff(repo: Path, base: str = "HEAD", path: Optional[str] = None) -> str:
     return require_git(repo, args)
 
 
-def file_at(repo: Path, ref: str, path: str) -> Optional[str]:
+def file_at(repo: Path, ref: str, path: str) -> str | None:
     """Return the contents of ``path`` at ``ref``, or ``None`` if absent."""
     validate_ref(ref)
-    result = run_git(repo, ["show", "%s:%s" % (ref, path)])
+    result = run_git(repo, ["show", f"{ref}:{path}"])
     return result.stdout if result.ok else None
 
 
@@ -154,13 +159,13 @@ def commit_all(repo: Path, message: str, exclude: Sequence[str] = (".custody",))
     work being committed, so it is excluded from the index. A tool that writes
     its own bookkeeping into the subject's history has changed the subject.
     """
-    pathspec = ["."] + [":(exclude)%s" % pattern for pattern in exclude]
+    pathspec = ["."] + [f":(exclude){pattern}" for pattern in exclude]
     require_git(repo, ["add", "-A", "--", *pathspec])
     result = run_git(repo, ["commit", "-m", message])
     if not result.ok and "nothing to commit" in (result.stdout + result.stderr):
         raise GitError("nothing to commit")
     if not result.ok:
-        raise GitError("commit failed: %s" % result.stderr.strip())
+        raise GitError(f"commit failed: {result.stderr.strip()}")
     return head_sha(repo)
 
 

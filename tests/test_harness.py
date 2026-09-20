@@ -6,10 +6,9 @@ import unittest
 from pathlib import Path
 
 from custody import gitio
-from custody.auditor.verdict import Ruling
-from custody.auditor.verdict import Judgment
+from custody.auditor.verdict import Judgment, Ruling
 from custody.findings import Finding, Pillar, Severity
-from custody.harness import CaseResult, HarnessRefusal, _apply, preflight, summarise_run
+from custody.harness import CaseResult, HarnessRefusalError, _apply, preflight, summarise_run
 from custody.ledger import Ledger
 from custody.trial import SCENARIOS, run_trial
 
@@ -36,13 +35,13 @@ class PreflightTests(unittest.TestCase):
         """Uncommitted work would make the diff meaningless as evidence."""
         root = scratch_repo()
         (root / "app.py").write_text("x = 2\n", encoding="utf-8")
-        with self.assertRaises(HarnessRefusal):
+        with self.assertRaises(HarnessRefusalError):
             preflight(root)
 
     def test_default_branch_is_refused(self) -> None:
         """The harness will not modify main without an explicit override."""
         root = scratch_repo(branch="main")
-        with self.assertRaises(HarnessRefusal):
+        with self.assertRaises(HarnessRefusalError):
             preflight(root)
 
     def test_default_branch_override_is_honoured(self) -> None:
@@ -51,7 +50,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_non_repository_is_refused(self) -> None:
         """A directory git does not track cannot be audited."""
-        with self.assertRaises(HarnessRefusal):
+        with self.assertRaises(HarnessRefusalError):
             preflight(Path(tempfile.mkdtemp()))
 
 
@@ -117,7 +116,7 @@ class AdversarialTrialTests(unittest.TestCase):
         for result, scenario in zip(results, SCENARIOS):
             self.assertIs(
                 result.judgment.ruling, scenario.expected,
-                "%s: expected %s" % (scenario.name, scenario.expected.value),
+                f"{scenario.name}: expected {scenario.expected.value}",
             )
 
     def test_every_expected_detector_fires(self) -> None:
@@ -132,12 +131,12 @@ class AdversarialTrialTests(unittest.TestCase):
     def test_only_the_honest_attempt_is_proven(self) -> None:
         """Exactly one of seven attempts survives adjudication."""
         results, summary = run_trial(verbose=False)
-        self.assertEqual(summary["rulings"][Ruling.PROVEN.value], 1)
+        self.assertEqual(summary.rulings[Ruling.PROVEN.value], 1)
 
     def test_ledger_survives_the_trial(self) -> None:
         """Seven adversarial attempts leave the chain intact."""
         _, summary = run_trial(verbose=False)
-        self.assertTrue(summary["ledger_intact"])
+        self.assertTrue(summary.ledger_intact)
 
 
 class EvidenceSurvivalTests(unittest.TestCase):
@@ -172,15 +171,15 @@ class EvidenceSurvivalTests(unittest.TestCase):
             )
         ]
         summary = summarise_run(fake, ledger)
-        self.assertTrue(summary["ledger_intact"])
-        self.assertFalse(summary["ledger_recorded"])
-        self.assertEqual(summary["ledger_entries"], 0)
+        self.assertTrue(summary.ledger_intact)
+        self.assertFalse(summary.ledger_recorded)
+        self.assertEqual(summary.ledger_entries, 0)
 
     def test_trial_records_every_step(self) -> None:
         """A full trial leaves a substantial, intact record behind."""
         _, summary = run_trial(verbose=False)
-        self.assertTrue(summary["ledger_recorded"])
-        self.assertGreater(summary["ledger_entries"], 20)
+        self.assertTrue(summary.ledger_recorded)
+        self.assertGreater(summary.ledger_entries, 20)
 
 
 class CustodyFootprintTests(unittest.TestCase):

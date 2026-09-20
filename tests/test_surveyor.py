@@ -9,7 +9,6 @@ from custody.surveyor.ast_rules import cyclomatic_complexity, parse_module, surv
 from custody.surveyor.runner import EXCLUDED_DIRS, iter_files, survey
 from custody.surveyor.secrets import looks_like_placeholder, redact, survey_secrets
 
-
 # Credential fixtures are assembled at runtime rather than written out.
 # A test file is still a file in the repository, and committing literal
 # key-shaped strings is the thing this module exists to detect - Custody flags
@@ -32,6 +31,13 @@ def write(root: Path, rel: str, text: str) -> Path:
     return path
 
 
+def survey_ids(source: str) -> list:
+    """Survey ``source`` in a scratch file and return its findings."""
+    root = Path(tempfile.mkdtemp())
+    path = write(root, "m.py", source)
+    return survey_source(path, "m.py") or []
+
+
 class AstRuleTests(unittest.TestCase):
     """Each rule fires on its own pattern and not on others."""
 
@@ -51,6 +57,47 @@ class AstRuleTests(unittest.TestCase):
             '    """D."""\n    subprocess.run(a, shell=True)\n'
         )
         self.assertIn("subprocess-shell-true", rules)
+
+    def test_truthy_nonbool_shell_is_flagged(self) -> None:
+        """``shell=1`` runs a shell exactly as ``shell=True`` does.
+
+        A rule keyed on the literal ``True`` reported nothing for it - a
+        one-character bypass of the flagship check.
+        """
+        rules = self._rules(
+            'import subprocess\n\n\ndef f(a: list) -> None:\n'
+            '    """D."""\n    subprocess.run(a, shell=1)\n'
+        )
+        self.assertIn("subprocess-shell-true", rules)
+
+    def test_falsy_shell_is_clean(self) -> None:
+        """``shell=0`` provably runs no shell."""
+        rules = self._rules(
+            'import subprocess\n\n\ndef f(a: list) -> None:\n'
+            '    """D."""\n    subprocess.run(a, shell=0)\n'
+        )
+        self.assertNotIn("subprocess-shell-true", rules)
+        self.assertNotIn("subprocess-shell-unresolved", rules)
+
+    def test_literal_dict_spread_shell_true_is_critical(self) -> None:
+        """A visible ``shell: True`` in a spread dict is the real thing."""
+        rules = self._rules(
+            'import subprocess\n\n\ndef f(a: list) -> None:\n'
+            '    """D."""\n    subprocess.run(a, **{"shell": True})\n'
+        )
+        self.assertIn("subprocess-shell-true", rules)
+
+    def test_deep_attribute_chain_is_not_collapsed(self) -> None:
+        """``obj.client.run`` is not ``subprocess.run``.
+
+        Collapsing a chain to its final attribute produced false positives
+        whenever ``from subprocess import run`` was in scope.
+        """
+        rules = self._rules(
+            'from subprocess import run\n\n\ndef f(obj: object) -> None:\n'
+            '    """D."""\n    obj.client.run("x")\n'
+        )
+        self.assertNotIn("subprocess-shell-unresolved", rules)
 
     def test_shell_false_is_not_flagged(self) -> None:
         """An explicit shell=False is correct and stays quiet."""
@@ -109,11 +156,17 @@ class AstRuleTests(unittest.TestCase):
         self.assertIn("bare-except", bare)
         self.assertNotIn("bare-except", typed)
 
-    def test_unparsable_file_yields_nothing_rather_than_crashing(self) -> None:
-        """A syntax error is skipped, not raised."""
+    def test_unparsable_file_is_distinguished_from_a_clean_one(self) -> None:
+        """A syntax error is a distinct answer, never an empty clean result."""
         path = write(self.root, "broken.py", "def (:\n")
-        self.assertEqual(survey_source(path, "broken.py"), [])
+        self.assertIsNone(survey_source(path, "broken.py"))
         self.assertIsNone(parse_module(path))
+
+    def test_unparsable_file_is_recorded_as_skipped_by_the_survey(self) -> None:
+        """The runner records what the AST rules could not examine."""
+        write(self.root, "broken.py", "def (:\n")
+        result = survey(self.root)
+        self.assertTrue(any("broken.py" in entry for entry in result.skipped))
 
     def test_results_are_deterministic(self) -> None:
         """Three surveys of the same file agree exactly."""
@@ -142,7 +195,8 @@ class ComplexityTests(unittest.TestCase):
 
     def test_each_branch_adds_one(self) -> None:
         """An if statement raises the count."""
-        self.assertEqual(self._complexity("def f(a):\n    if a:\n        return 1\n    return 2\n"), 2)
+        branchy = "def f(a):\n    if a:\n        return 1\n    return 2\n"
+        self.assertEqual(self._complexity(branchy), 2)
 
     def test_boolean_operators_count(self) -> None:
         """Short-circuit operators are branches."""
@@ -167,15 +221,15 @@ class SecretTests(unittest.TestCase):
 
     def test_live_looking_keys_are_flagged(self) -> None:
         """A key-shaped string with no placeholder marker is reported."""
-        self.assertIn("secret-aws-access-key", self._rules('K = "%s"\n' % LIVE_AWS_KEY))
+        self.assertIn("secret-aws-access-key", self._rules(f'K = "{LIVE_AWS_KEY}"\n'))
         self.assertIn(
-            "secret-anthropic-key", self._rules('K = "%s"\n' % LIVE_ANTHROPIC_KEY)
+            "secret-anthropic-key", self._rules(f'K = "{LIVE_ANTHROPIC_KEY}"\n')
         )
 
     def test_placeholders_are_not_flagged(self) -> None:
         """Obvious stand-ins do not become findings."""
         for text in (
-            'KEY = "%s"\n' % PLACEHOLDER_AWS_KEY,
+            f'KEY = "{PLACEHOLDER_AWS_KEY}"\n',
             'api_key = "your-key-here-1234567890"\n',
             'TOKEN = "changeme-changeme-changeme"\n',
         ):
@@ -213,11 +267,38 @@ class RunnerTests(unittest.TestCase):
 
     def test_excluded_directories_are_not_walked(self) -> None:
         """Vendored and generated trees are skipped."""
-        visited = {p.name for p in iter_files(self.root)}
+        files, truncated = iter_files(self.root)
+        visited = {p.name for p in files}
         self.assertIn("mod.py", visited)
         self.assertNotIn("index.py", visited)
         self.assertNotIn("cached.py", visited)
         self.assertNotIn("config", visited)
+        self.assertFalse(truncated)
+
+    def test_dotenv_files_are_scanned(self) -> None:
+        """.env has no suffix, which must not exempt it from the secret scan.
+
+        It is the single most common place a credential is committed.
+        """
+        write(self.root, ".env", "nothing here\n")
+        write(self.root, ".env.local", "nothing here\n")
+        files, _ = iter_files(self.root)
+        names = {p.name for p in files}
+        self.assertIn(".env", names)
+        self.assertIn(".env.local", names)
+
+    def test_uppercase_python_suffix_is_surveyed(self) -> None:
+        """M.PY and m.py are the same kind of file to the AST rules."""
+        write(self.root, "M.PY", "import os\n\nos.system('x')\n")
+        result = survey(self.root)
+        self.assertTrue(any(f.rule == "dangerous-call-os-system" for f in result.findings))
+
+    def test_oversized_file_is_recorded_as_skipped(self) -> None:
+        """A file too large to scan is reported, never silently clean."""
+        write(self.root, "big.txt", "A" * (2_000_001))
+        result = survey(self.root)
+        self.assertTrue(any("big.txt" in entry for entry in result.skipped))
+        self.assertIn("skipped", result.summary())
 
     def test_summary_counts_what_was_examined(self) -> None:
         """A survey reports its own scope, not only its findings."""
@@ -242,6 +323,11 @@ class RunnerTests(unittest.TestCase):
         """Two walks visit the same files in the same order."""
         self.assertEqual(iter_files(self.root), iter_files(self.root))
 
+    def test_exactly_full_tree_is_complete(self) -> None:
+        """Hitting the file limit exactly is completion, not truncation."""
+        _, truncated = iter_files(self.root)
+        self.assertFalse(truncated)
+
     def test_custody_artifacts_are_excluded(self) -> None:
         """Custody does not survey its own ledger."""
         self.assertIn(".custody", EXCLUDED_DIRS)
@@ -250,13 +336,39 @@ class RunnerTests(unittest.TestCase):
 class FindingTests(unittest.TestCase):
     """Finding identity and ordering."""
 
-    def test_id_is_stable_for_the_same_location(self) -> None:
+    def test_id_is_stable_for_the_same_content(self) -> None:
         """The same problem gets the same id every run."""
-        self.assertEqual(finding_id("r", "a.py", 3), finding_id("r", "a.py", 3))
+        self.assertEqual(
+            finding_id("r", "a.py", "os.system(x)"), finding_id("r", "a.py", "os.system(x)")
+        )
 
-    def test_id_differs_by_location(self) -> None:
-        """Different locations are different findings."""
-        self.assertNotEqual(finding_id("r", "a.py", 3), finding_id("r", "a.py", 4))
+    def test_id_differs_by_content(self) -> None:
+        """Different flagged content is a different finding."""
+        self.assertNotEqual(
+            finding_id("r", "a.py", "os.system(x)"), finding_id("r", "a.py", "os.system(y)")
+        )
+
+    def test_id_survives_the_code_moving(self) -> None:
+        """Inserting a line above a finding must not retire its id.
+
+        Under line-keyed ids, one inserted comment changed the id, the
+        contracted id vanished from a fresh survey, and an unfixed finding
+        adjudicated as PROVEN.
+        """
+        before = 'import os\n\n\ndef f(c):\n    """F."""\n    return os.system(c)\n'
+        after = "# a comment\n" + before
+        ids_before = [f.id for f in survey_ids(before) if f.rule.startswith("dangerous")]
+        ids_after = [f.id for f in survey_ids(after) if f.rule.startswith("dangerous")]
+        self.assertEqual(ids_before, ids_after)
+
+    def test_duplicate_content_gets_distinct_stable_ids(self) -> None:
+        """Two identical dangerous lines are two findings, reproducibly."""
+        source = "import os\n\nos.system(c)\nos.system(c)\n"
+        first = [f.id for f in survey_ids(source) if f.rule.startswith("dangerous")]
+        second = [f.id for f in survey_ids(source) if f.rule.startswith("dangerous")]
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 2)
+        self.assertNotEqual(first[0], first[1])
 
     def test_severity_orders_worst_first(self) -> None:
         """Critical sorts ahead of low."""

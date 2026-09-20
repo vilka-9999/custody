@@ -8,12 +8,13 @@ be run at all. The second is never reported as the first, and never as a pass.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
 
 DEFAULT_TIMEOUT = 600
 """Seconds a test suite may run before it is killed."""
@@ -37,7 +38,7 @@ class TestOutcome:
 
     ran: bool
     passed: bool
-    command: List[str]
+    command: list[str]
     returncode: int = -1
     output: str = ""
     reason: str = ""
@@ -48,7 +49,7 @@ class TestOutcome:
             return "test suite did not run (%s) - this is not a pass" % (self.reason or "unknown")
         return "test suite %s (exit %d)" % ("passed" if self.passed else "FAILED", self.returncode)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         """Return a JSON-serialisable view for the ledger."""
         return {
             "ran": self.ran,
@@ -60,16 +61,22 @@ class TestOutcome:
         }
 
 
-def detect_command(repo: Path) -> Optional[List[str]]:
+def detect_command(repo: Path) -> list[str] | None:
     """Choose how to run this project's tests, or return ``None``.
 
     Preference order is deliberate: an explicit pytest layout wins, then a
     stdlib unittest discovery, because unittest works with no dependencies at
     all and is therefore the safer fallback.
+
+    The discovery start directory follows where the tests actually live. An
+    earlier version always discovered in ``tests``, so a repository with its
+    ``test_*.py`` files at the root "had tests" but the runner crashed on a
+    missing directory - reported as a suite the agent's change broke, which
+    rejected every honest fix the repository received.
     """
     tests_dir = repo / "tests"
-    has_tests = tests_dir.is_dir() or any(repo.glob("test_*.py"))
-    if not has_tests:
+    root_tests = any(repo.glob("test_*.py"))
+    if not tests_dir.is_dir() and not root_tests:
         return None
 
     if shutil.which("pytest") and (repo / "pytest.ini").exists():
@@ -84,12 +91,23 @@ def detect_command(repo: Path) -> Optional[List[str]]:
     if config_mentions_pytest and shutil.which("pytest"):
         return ["pytest", "-q"]
 
-    return [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"]
+    start = "tests" if tests_dir.is_dir() else "."
+    return [sys.executable, "-m", "unittest", "discover", "-s", start, "-q"]
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """Return the environment with Custody's own secret removed.
+
+    The suite under test is the target repository's code - including code the
+    remediator just wrote - and it runs before adjudication. It has no
+    business reading the API key Custody itself was started with.
+    """
+    return {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
 
 
 def run_tests(
     repo: Path,
-    command: Optional[Sequence[str]] = None,
+    command: Sequence[str] | None = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> TestOutcome:
     """Run the project's tests inside ``repo`` and capture the outcome."""
@@ -111,23 +129,30 @@ def run_tests(
             errors="replace",
             timeout=timeout,
             check=False,
+            env=_scrubbed_env(),
         )
     except FileNotFoundError:
         return TestOutcome(
             ran=False, passed=False, command=chosen,
-            reason="test runner %r is not installed" % chosen[0],
+            reason=f"test runner {chosen[0]!r} is not installed",
         )
     except subprocess.TimeoutExpired:
         return TestOutcome(
             ran=False, passed=False, command=chosen,
-            reason="test suite exceeded %ss and was killed" % timeout,
+            reason=f"test suite exceeded {timeout}s and was killed",
         )
     except OSError as exc:
         return TestOutcome(
-            ran=False, passed=False, command=chosen, reason="could not start runner: %s" % exc
+            ran=False, passed=False, command=chosen, reason=f"could not start runner: {exc}"
         )
 
     output = (completed.stdout + completed.stderr)[-MAX_CAPTURED_OUTPUT:]
+    if _collected_no_tests(chosen, completed.returncode, output):
+        return TestOutcome(
+            ran=False, passed=False, command=chosen,
+            returncode=completed.returncode, output=output,
+            reason="the runner collected no tests; a suite that asks nothing verifies nothing",
+        )
     return TestOutcome(
         ran=True,
         passed=completed.returncode == 0,
@@ -135,3 +160,16 @@ def run_tests(
         returncode=completed.returncode,
         output=output,
     )
+
+
+def _collected_no_tests(command: list[str], returncode: int, output: str) -> bool:
+    """Return whether the runner exited without collecting a single test.
+
+    ``unittest discover`` that finds nothing prints ``Ran 0 tests`` (and, on
+    older Pythons, exits zero); pytest signals the same with exit code 5.
+    Either way the gate examined nothing, which must never be recorded as the
+    suite having passed.
+    """
+    if command and "pytest" in Path(command[0]).name and returncode == 5:
+        return True
+    return "unittest" in command and "Ran 0 tests" in output

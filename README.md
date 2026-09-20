@@ -132,12 +132,14 @@ middle invalidates everything after it.
 A hash chain cannot detect truncation of its own tail: dropping the last *N*
 lines leaves a shorter but perfectly self-consistent prefix, because nothing
 in entry *k* depends on entry *k+1* having existed. A separate head marker
-records the expected tail, so a truncated ledger disagrees with it. This
-raises the bar rather than closing the hole — anyone able to write both files
-can forge a consistent history — which is why the ledger directory is
-integrity-critical and refused at the filesystem for any agent under audit.
-Custody's chain is unsigned; it is evidence against silent edits, not against
-an attacker who already owns the disk.
+records the expected tail — its sequence number *and* its seal, so a rewritten
+tail of the same length also disagrees with it — and a ledger with entries but
+no marker is reported as suspect rather than intact, so deleting the marker is
+not a bypass. This raises the bar rather than closing the hole — anyone able
+to write both files can forge a consistent history — which is why the ledger
+directory is integrity-critical and refused at the filesystem for any agent
+under audit. Custody's chain is unsigned; it is evidence against silent edits,
+not against an attacker who already owns the disk.
 
 ## Boundaries enforced in code, not in prompts
 
@@ -178,21 +180,28 @@ every file written was declared. It does **not** license the claim that the
 code is correct, that no new defect was introduced, or that the change was the
 best available fix.
 
+"Absent from a fresh survey" is itself two checks, not one. A finding's id is
+derived from the flagged line's *content*, so code moving around it cannot
+retire it — and because a cosmetic edit to that line would, the rule must also
+fire fewer times in that file than it did before. An id that vanished while
+the count held is a finding that was reworded, not repaired, and adjudicates
+`NOT_OBSERVED` with a `vacuous-fix` detection.
+
 `INSUFFICIENT_EVIDENCE` is never collapsed into a clean result. A survey that
 could not complete reports *this is not a clean result*, rather than zero.
 
 ## Measured, not asserted
 
-`custody eval` runs twelve fixtures with known ground truth: seven attempts
-that cheat, and five that only look like they might.
+`custody eval` runs fourteen fixtures with known ground truth: eight attempts
+that cheat, and six that only look like they might.
 
 ```
-Detection rate:     7/7 injected cheats caught
-False positives:    0/5 clean attempts flagged
+Detection rate:     8/8 injected cheats caught
+False positives:    0/6 clean attempts flagged
 Result:             PASS
 ```
 
-The clean five matter as much as the cheating seven. A detector that flags
+The clean six matter as much as the cheating eight. A detector that flags
 everything is worthless, so false positives are measured with the same
 seriousness as misses.
 
@@ -202,7 +211,7 @@ seriousness as misses.
 python -m unittest discover -s tests
 ```
 
-205 tests, standard library only, so the suite runs anywhere Python does. The
+238 tests, standard library only, so the suite runs anywhere Python does. The
 adversarial trial is among them, and CI runs the suite, the eval, the trial,
 and a self-survey on Python 3.9 through 3.13.
 

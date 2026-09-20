@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable
 
 from custody import __version__, gitio
 from custody.findings import Finding, sort_findings
 from custody.ledger import Ledger
 from custody.surveyor.runner import survey
 
+if TYPE_CHECKING:
+    from custody.harness import CaseResult, Proposal
+
+ProposalFn = Callable[[Path, Finding], "Proposal | None"]
+"""The remediator interface: one finding in, a proposal or a decline out."""
+
 DEFAULT_LEDGER = Path(".custody") / "ledger.jsonl"
 
 
-def _print_findings(findings: List[Finding], limit: int) -> None:
+def _print_findings(findings: list[Finding], limit: int) -> None:
     """Print findings in severity order, truncated to ``limit``."""
     for finding in findings[:limit]:
         print(
@@ -49,7 +56,7 @@ def cmd_survey(args: argparse.Namespace) -> int:
         ))
         return 0
 
-    print("Custody survey: %s" % Path(args.repo).resolve())
+    print(f"Custody survey: {Path(args.repo).resolve()}")
     print(result.summary())
     if result.skipped:
         print("skipped %d path(s); this is not a clean result for them" % len(result.skipped))
@@ -60,26 +67,35 @@ def cmd_survey(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     """Recompute the ledger hash chain and report whether it reconciles."""
+    from custody.ledger import LedgerError
+
     path = Path(args.repo) / DEFAULT_LEDGER
     if not path.exists():
-        print("no ledger at %s - nothing has been recorded" % path)
+        print(f"no ledger at {path} - nothing has been recorded")
         return 1
-    ledger = Ledger(path)
-    report = ledger.verify()
-    print("Custody ledger: %s" % path)
+    print(f"Custody ledger: {path}")
+    try:
+        ledger = Ledger(path)
+        report = ledger.verify()
+        spend = ledger.total_cost()
+    except LedgerError as exc:
+        # A file that cannot even be read as a ledger is a broken chain, not
+        # a crash: the verdict must be printed, not raised.
+        print(f"chain BROKEN: {exc}")
+        return 2
     print(report.summary())
-    print("recorded spend: $%.4f" % ledger.total_cost())
+    print(f"recorded spend: ${spend:.4f}")
     return 0 if report.intact else 2
 
 
-def cmd_eval(args: argparse.Namespace) -> int:
+def cmd_eval(_args: argparse.Namespace) -> int:
     """Run the auditor against the ground-truth fixtures."""
     from custody.evaluation import main as run_eval
 
     return run_eval()
 
 
-def cmd_trial(args: argparse.Namespace) -> int:
+def cmd_trial(_args: argparse.Namespace) -> int:
     """Run the adversarial trial: seven attempts, one honest."""
     from custody.trial import main as run_trial_main
 
@@ -94,18 +110,19 @@ def cmd_console(args: argparse.Namespace) -> int:
     return 0
 
 
-def _key(finding: Finding) -> tuple:
-    """Return an identity for a finding that survives line-number drift.
+def _key(finding: Finding) -> tuple[str, str, object]:
+    """Return an identity for a finding that survives edits near it.
 
-    A finding's id is derived from its location, so committing a fix above it
-    changes the id of everything below. Keying on the symbol when one is known
-    keeps "already attempted" meaningful across a re-survey.
+    Ids are content-anchored, so they already survive line drift; this key
+    additionally survives the flagged line itself being rewritten by a failed
+    attempt, by preferring the symbol name when one is known. That keeps
+    "already attempted" meaningful across a re-survey.
     """
     symbol = finding.detail.get("symbol") or finding.detail.get("function")
     return (finding.rule, finding.path, symbol or finding.line)
 
 
-def _select_remediator(args: argparse.Namespace) -> Tuple[str, Callable]:
+def _select_remediator(args: argparse.Namespace) -> tuple[str, ProposalFn]:
     """Choose a remediator and return its name alongside a proposal function.
 
     Falling back to the deterministic remediator when no key is present is a
@@ -113,7 +130,8 @@ def _select_remediator(args: argparse.Namespace) -> Tuple[str, Callable]:
     silently substituted.
     """
     from custody.remediator import deterministic
-    from custody.remediator.agent import available, propose as llm_propose
+    from custody.remediator.agent import available
+    from custody.remediator.agent import propose as llm_propose
 
     if args.offline or not available():
         if not args.offline:
@@ -121,14 +139,14 @@ def _select_remediator(args: argparse.Namespace) -> Tuple[str, Callable]:
             print("It fixes a subset of rules and declines the rest.")
         return "deterministic", lambda repo, finding: deterministic.propose(repo, finding)
 
-    return "model:%s" % args.model, lambda repo, finding: llm_propose(
+    return f"model:{args.model}", lambda repo, finding: llm_propose(
         repo, finding, model=args.model, effort=args.effort
     )
 
 
 def _obtain_proposal(
-    repo: Path, finding: Finding, make_proposal: Callable, ledger: Ledger
-) -> Optional[object]:
+    repo: Path, finding: Finding, make_proposal: ProposalFn, ledger: Ledger
+) -> Proposal | None:
     """Ask the chosen remediator for a proposal, recording why it declined.
 
     A decline and a failure are recorded as different events. The first means
@@ -145,7 +163,7 @@ def _obtain_proposal(
             "remediator", "proposal.failed", target=finding.id,
             detail={"error": str(exc), "rule": finding.rule},
         )
-        print("    proposal failed: %s" % exc)
+        print(f"    proposal failed: {exc}")
         return None
 
     if proposal is None:
@@ -160,10 +178,10 @@ def _obtain_proposal(
 def _run_attempts(
     repo: Path,
     limit: int,
-    make_proposal: Callable,
+    make_proposal: ProposalFn,
     ledger: Ledger,
     commit: bool,
-) -> Tuple[List[object], int, int]:
+) -> tuple[list[CaseResult], int, int]:
     """Attempt findings one at a time, re-deriving the queue before each.
 
     A committed fix shifts the line numbers of everything below it in the same
@@ -178,8 +196,8 @@ def _run_attempts(
     """
     from custody.harness import run_case
 
-    results: List[object] = []
-    attempted: set = set()
+    results: list[CaseResult] = []
+    attempted: set[tuple[str, str, object]] = set()
     declined = 0
     attempts = 0
 
@@ -217,15 +235,15 @@ def _run_attempts(
 
 def cmd_harden(args: argparse.Namespace) -> int:
     """Run the full loop: propose under contract, verify, adjudicate, keep or revert."""
-    from custody.harness import HarnessRefusal, preflight, summarise_run
+    from custody.harness import HarnessRefusalError, preflight, summarise_run
 
     repo = Path(args.repo)
     remediator_name, make_proposal = _select_remediator(args)
 
     try:
         base_sha = preflight(repo, allow_default_branch=args.allow_default_branch)
-    except HarnessRefusal as exc:
-        print("refusing to run: %s" % exc)
+    except HarnessRefusalError as exc:
+        print(f"refusing to run: {exc}")
         return 1
 
     result = survey(repo)
@@ -256,21 +274,25 @@ def cmd_harden(args: argparse.Namespace) -> int:
     )
 
     summary = summarise_run(results, ledger)
-    summary["declined"] = declined
-    summary["attempts"] = attempts
-    summary["findings_at_start"] = len(result.findings)
-    summary["findings_now"] = len(survey(repo).findings)
-    ledger.append("harness", "run.finished", target=str(repo), detail=summary)
+    findings_now = len(survey(repo).findings)
+    detail = summary.to_dict()
+    detail.update({
+        "declined": declined,
+        "attempts": attempts,
+        "findings_at_start": len(result.findings),
+        "findings_now": findings_now,
+    })
+    ledger.append("harness", "run.finished", target=str(repo), detail=detail)
     print("")
     print("  %d adjudicated, %d declined, over %d attempt(s)"
           % (len(results), declined, attempts))
-    print("  findings %d -> %d" % (summary["findings_at_start"], summary["findings_now"]))
-    for ruling, count in sorted(summary["rulings"].items()):
+    print("  findings %d -> %d" % (len(result.findings), findings_now))
+    for ruling, count in sorted(summary.rulings.items()):
         print("  %-22s %d" % (ruling, count))
-    print("  committed              %d" % summary["committed"])
-    print("  spend                  $%.4f" % summary["spend_usd"])
-    print("  ledger entries         %d" % summary["ledger_entries"])
-    print("  ledger recorded        %s" % summary["ledger_recorded"])
+    print("  committed              %d" % summary.committed)
+    print(f"  spend                  ${summary.spend_usd:.4f}")
+    print("  ledger entries         %d" % summary.ledger_entries)
+    print(f"  ledger recorded        {summary.ledger_recorded}")
     return 0
 
 
@@ -279,7 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="custody", description="Chain of custody for machine-written code."
     )
-    parser.add_argument("--version", action="version", version="custody %s" % __version__)
+    parser.add_argument("--version", action="version", version=f"custody {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     survey_parser = subparsers.add_parser("survey", help="run the deterministic survey")
@@ -331,7 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments and dispatch to the chosen command."""
     args = build_parser().parse_args(argv)
     return int(args.func(args))

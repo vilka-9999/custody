@@ -18,8 +18,9 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
@@ -33,7 +34,7 @@ DEFAULT_MAX_TOKENS = 16000
 DEFAULT_TIMEOUT = 600
 DEFAULT_RETRIES = 3
 
-PRICING_USD_PER_MTOK: Dict[str, Dict[str, float]] = {
+PRICING_USD_PER_MTOK: dict[str, dict[str, float]] = {
     "claude-opus-5": {"input": 5.00, "output": 25.00},
     "claude-sonnet-5": {"input": 2.00, "output": 10.00},
     "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
@@ -53,9 +54,9 @@ class LLMError(RuntimeError):
 class RefusalError(LLMError):
     """Raised when the model declines the request on safety grounds."""
 
-    def __init__(self, category: Optional[str], explanation: str) -> None:
+    def __init__(self, category: str | None, explanation: str) -> None:
         """Record the structured refusal details the API returned."""
-        super().__init__("model refused (%s): %s" % (category or "unspecified", explanation))
+        super().__init__("model refused ({}): {}".format(category or "unspecified", explanation))
         self.category = category
         self.explanation = explanation
 
@@ -94,7 +95,7 @@ class Usage:
         )
         return round(total / 1_000_000, 6)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable view for the ledger."""
         return {
             "model": self.model,
@@ -112,13 +113,13 @@ class Reply:
     """One model response, decomposed for callers."""
 
     text: str
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = ""
     usage: Usage = field(default_factory=lambda: Usage(DEFAULT_MODEL))
-    raw_content: List[Dict[str, Any]] = field(default_factory=list)
+    raw_content: list[dict[str, Any]] = field(default_factory=list)
 
 
-def api_key(explicit: Optional[str] = None) -> str:
+def api_key(explicit: str | None = None) -> str:
     """Return the API key, preferring an explicit value over the environment."""
     key = explicit or os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
@@ -128,10 +129,10 @@ def api_key(explicit: Optional[str] = None) -> str:
     return key
 
 
-def _decompose(content: Sequence[Dict[str, Any]]) -> tuple:
+def _decompose(content: Sequence[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     """Split response content blocks into text and tool calls."""
-    text_parts: List[str] = []
-    tool_calls: List[Dict[str, Any]] = []
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
     for block in content:
         kind = block.get("type")
         if kind == "text":
@@ -144,7 +145,7 @@ def _decompose(content: Sequence[Dict[str, Any]]) -> tuple:
     return "\n".join(text_parts).strip(), tool_calls
 
 
-def _post(payload: Dict[str, Any], key: str, timeout: int) -> Dict[str, Any]:
+def _post(payload: dict[str, Any], key: str, timeout: int) -> dict[str, Any]:
     """Send one request and return the decoded JSON body."""
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -158,7 +159,8 @@ def _post(payload: Dict[str, Any], key: str, timeout: int) -> Dict[str, Any]:
         },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+        decoded: dict[str, Any] = json.loads(response.read().decode("utf-8"))
+        return decoded
 
 
 def call(
@@ -167,10 +169,10 @@ def call(
     model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     effort: str = "high",
-    tools: Optional[List[Dict[str, Any]]] = None,
+    tools: list[dict[str, Any]] | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     retries: int = DEFAULT_RETRIES,
-    key: Optional[str] = None,
+    key: str | None = None,
 ) -> Reply:
     """Send one message and return the decomposed reply.
 
@@ -181,7 +183,7 @@ def call(
         RefusalError: If the model declined on safety grounds.
         LLMError: If the request failed after exhausting retries.
     """
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
@@ -205,7 +207,7 @@ def call(
             if exc.code not in RETRYABLE_STATUS:
                 raise LLMError(last_error) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            last_error = "connection error: %s" % exc
+            last_error = f"connection error: {exc}"
         except json.JSONDecodeError as exc:
             raise LLMError("malformed response body") from exc
         else:
@@ -217,7 +219,7 @@ def call(
     raise LLMError("request failed after %d attempts: %s" % (retries, last_error))
 
 
-def _build_reply(data: Dict[str, Any], model: str) -> Reply:
+def _build_reply(data: dict[str, Any], model: str) -> Reply:
     """Turn a decoded response body into a :class:`Reply`."""
     stop_reason = data.get("stop_reason", "")
     if stop_reason == "refusal":
@@ -270,7 +272,7 @@ def _scan_object_end(text: str, start: int) -> int:
     return -1
 
 
-def extract_json(text: str) -> Optional[Dict[str, Any]]:
+def extract_json(text: str) -> dict[str, Any] | None:
     """Pull the first JSON object out of a model response.
 
     Tool inputs and structured replies are always parsed as JSON rather than

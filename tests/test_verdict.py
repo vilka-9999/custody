@@ -1,7 +1,6 @@
 """Tests for adjudication and the claims each ruling licenses."""
 
 import unittest
-from typing import List
 
 from custody.auditor.detectors import Detection, DiffContext
 from custody.auditor.verdict import Ruling, adjudicate, summarise
@@ -11,13 +10,17 @@ from custody.remediator.contract import ScopeContract
 SRC = "pkg/module.py"
 
 
-def finding() -> Finding:
-    """Return the finding under adjudication."""
-    return Finding("CUS-1", "rule", Pillar.QUALITY, Severity.LOW, SRC, 1, "message")
+def finding(finding_id: str = "CUS-1") -> Finding:
+    """Return a finding of the rule under adjudication."""
+    return Finding(finding_id, "rule", Pillar.QUALITY, Severity.LOW, SRC, 1, "message")
 
 
 def context(**kwargs: object) -> DiffContext:
-    """Build a DiffContext with sensible defaults."""
+    """Build a DiffContext describing an honest attempt with a green suite.
+
+    ``tests_ran`` is set explicitly because DiffContext defaults are
+    pessimistic: unstated evidence counts as absent.
+    """
     defaults = {
         "contract": ScopeContract("CUS-1", [SRC], "hypothesis", "verification", "0" * 40),
         "changed": [SRC],
@@ -25,7 +28,9 @@ def context(**kwargs: object) -> DiffContext:
         "after": {SRC: "b\n"},
         "findings_before": [finding()],
         "findings_after": [],
+        "tests_ran": True,
         "tests_passed": True,
+        "cost_measurable": True,
     }
     defaults.update(kwargs)
     return DiffContext(**defaults)
@@ -63,6 +68,24 @@ class AdjudicationTests(unittest.TestCase):
         ctx = context(findings_before=[])
         self.assertIs(adjudicate(ctx, []).ruling, Ruling.INSUFFICIENT_EVIDENCE)
 
+    def test_reworded_finding_is_not_proven(self) -> None:
+        """A retired id alone does not clear a finding the rule still reports.
+
+        Editing the flagged line cosmetically changes its content anchor, so
+        the contracted id vanishes from a fresh survey - but the rule fires
+        exactly as often as before. Both signals must clear for PROVEN.
+        """
+        ctx = context(findings_after=[finding("CUS-2")])
+        self.assertIs(adjudicate(ctx, []).ruling, Ruling.NOT_OBSERVED)
+
+    def test_fixing_one_of_two_instances_is_proven(self) -> None:
+        """A genuine fix is not penalised for a sibling finding surviving."""
+        ctx = context(
+            findings_before=[finding("CUS-1"), finding("CUS-2")],
+            findings_after=[finding("CUS-2")],
+        )
+        self.assertIs(adjudicate(ctx, []).ruling, Ruling.PROVEN)
+
 
 class ClaimBoundaryTests(unittest.TestCase):
     """Every ruling states what it does not license."""
@@ -75,7 +98,7 @@ class ClaimBoundaryTests(unittest.TestCase):
 
     def test_every_ruling_has_both_lists(self) -> None:
         """No ruling is issued without stated boundaries."""
-        cases: List[DiffContext] = [context(), context(findings_after=[finding()])]
+        cases: list[DiffContext] = [context(), context(findings_after=[finding()])]
         for ctx in cases:
             judgment = adjudicate(ctx, [])
             self.assertTrue(judgment.permitted_claims)
@@ -87,10 +110,6 @@ class ClaimBoundaryTests(unittest.TestCase):
         self.assertEqual(counts[Ruling.PROVEN.value], 1)
         self.assertIn(Ruling.INSUFFICIENT_EVIDENCE.value, counts)
         self.assertEqual(counts[Ruling.REJECTED.value], 0)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class UnrunSuiteTests(unittest.TestCase):
@@ -119,3 +138,10 @@ class UnrunSuiteTests(unittest.TestCase):
         cheat = Detection("scope-escape", Severity.CRITICAL, SRC, "wrote an undeclared file")
         judgment = adjudicate(context(tests_ran=False, tests_passed=False), [cheat])
         self.assertIs(judgment.ruling, Ruling.REJECTED)
+
+
+# This block sits after every test class on purpose: an earlier version
+# placed it mid-file, and direct invocation silently never defined the
+# classes below it - a check that stopped running while reporting clean.
+if __name__ == "__main__":
+    unittest.main()

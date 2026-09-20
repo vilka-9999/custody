@@ -57,6 +57,21 @@ class DetectionTests(unittest.TestCase):
         """There is nothing to run, and that is said plainly."""
         self.assertIsNone(detect_command(Path(tempfile.mkdtemp())))
 
+    def test_root_level_tests_discover_where_they_live(self) -> None:
+        """A repository with test_*.py at the root gets a runnable command.
+
+        An earlier version always discovered in ``tests/``, so this layout
+        "had tests" but the runner crashed on a missing directory - reported
+        as a suite the agent's change broke, rejecting every honest fix.
+        """
+        root = Path(tempfile.mkdtemp())
+        (root / "test_root.py").write_text(PASSING_SUITE, encoding="utf-8")
+        command = detect_command(root)
+        self.assertIsNotNone(command)
+        outcome = run_tests(root)
+        self.assertTrue(outcome.ran)
+        self.assertTrue(outcome.passed)
+
 
 class OutcomeTests(unittest.TestCase):
     """The three outcomes are kept distinct."""
@@ -119,6 +134,49 @@ class OutcomeTests(unittest.TestCase):
         self.assertIn("ran", recorded)
         self.assertIn("passed", recorded)
         self.assertFalse(recorded["ran"])
+
+    def test_zero_collected_tests_is_not_a_pass(self) -> None:
+        """A runner that examined nothing verified nothing.
+
+        ``unittest discover`` finding zero tests exits zero on some Pythons,
+        which read as a green gate that had asked no questions.
+        """
+        root = Path(tempfile.mkdtemp())
+        (root / "tests").mkdir()
+        (root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        outcome = run_tests(root)
+        self.assertFalse(outcome.ran)
+        self.assertFalse(outcome.passed)
+        self.assertIn("collected no tests", outcome.reason)
+
+    def test_api_key_is_not_inherited_by_the_suite(self) -> None:
+        """The suite runs remediator-written code before adjudication.
+
+        It must not be able to read the key Custody was started with.
+        """
+        import os
+
+        probe = (
+            '"""Suite."""\n\nimport os\nimport unittest\n\n\n'
+            'class T(unittest.TestCase):\n    """T."""\n\n'
+            '    def test_no_key(self) -> None:\n        """No key."""\n'
+            '        self.assertIsNone(os.environ.get("ANTHROPIC_API_KEY"))\n'
+        )
+        root = Path(tempfile.mkdtemp())
+        (root / "tests").mkdir()
+        (root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "tests" / "test_probe.py").write_text(probe, encoding="utf-8")
+        previous = os.environ.get("ANTHROPIC_API_KEY")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test-not-a-real-key"
+        try:
+            outcome = run_tests(root)
+        finally:
+            if previous is None:
+                del os.environ["ANTHROPIC_API_KEY"]
+            else:
+                os.environ["ANTHROPIC_API_KEY"] = previous
+        self.assertTrue(outcome.ran)
+        self.assertTrue(outcome.passed, outcome.output)
 
 
 if __name__ == "__main__":

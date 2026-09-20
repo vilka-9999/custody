@@ -16,7 +16,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable
 
 from custody.findings import Finding
 from custody.harness import Proposal
@@ -25,7 +25,7 @@ from custody.remediator.contract import ScopeContract, is_protected
 SHELL_TRUE = re.compile(r",\s*shell\s*=\s*True")
 
 
-def _lines(source: str) -> List[str]:
+def _lines(source: str) -> list[str]:
     """Split source into lines, preserving the ability to rejoin exactly."""
     return source.split("\n")
 
@@ -35,7 +35,7 @@ def _indent_of(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
 
 
-def fix_shell_true(source: str, finding: Finding) -> Optional[str]:
+def fix_shell_true(source: str, finding: Finding) -> str | None:
     """Remove ``shell=True`` from a subprocess call.
 
     Dropping the keyword makes the call pass its argument list directly to the
@@ -57,7 +57,7 @@ def fix_shell_true(source: str, finding: Finding) -> Optional[str]:
     return "\n".join(lines)
 
 
-def fix_bare_except(source: str, finding: Finding) -> Optional[str]:
+def fix_bare_except(source: str, finding: Finding) -> str | None:
     """Narrow a bare ``except:`` to ``except Exception:``.
 
     This preserves the handler's intent while letting KeyboardInterrupt and
@@ -71,23 +71,23 @@ def fix_bare_except(source: str, finding: Finding) -> Optional[str]:
     stripped = lines[index].strip()
     if stripped != "except:":
         return None
-    lines[index] = "%sexcept Exception:" % _indent_of(lines[index])
+    lines[index] = f"{_indent_of(lines[index])}except Exception:"
     return "\n".join(lines)
 
 
 def _docstring_for(node: ast.AST, name: str) -> str:
     """Compose a minimal, accurate docstring for a node with none."""
     if isinstance(node, ast.ClassDef):
-        return '"""%s."""' % name
+        return f'"""{name}."""'
     returns = getattr(node, "returns", None)
     if returns is not None and not (
         isinstance(returns, ast.Constant) and returns.value is None
     ):
-        return '"""Return the result of %s."""' % name
-    return '"""Perform %s."""' % name
+        return f'"""Return the result of {name}."""'
+    return f'"""Perform {name}."""'
 
 
-def fix_missing_docstring(source: str, finding: Finding) -> Optional[str]:
+def fix_missing_docstring(source: str, finding: Finding) -> str | None:
     """Insert a minimal docstring on a public function or class.
 
     A generated docstring is a weak fix and it is worth being honest about
@@ -121,13 +121,13 @@ def fix_missing_docstring(source: str, finding: Finding) -> Optional[str]:
     return "\n".join(lines)
 
 
-FIXERS: Dict[str, Callable[[str, Finding], Optional[str]]] = {
+FIXERS: dict[str, Callable[[str, Finding], str | None]] = {
     "subprocess-shell-true": fix_shell_true,
     "bare-except": fix_bare_except,
     "missing-docstring": fix_missing_docstring,
 }
 
-HYPOTHESES: Dict[str, str] = {
+HYPOTHESES: dict[str, str] = {
     "subprocess-shell-true": "drop shell=True so the argument list goes straight to the OS",
     "bare-except": "narrow the handler to Exception so control-flow signals propagate",
     "missing-docstring": "add a minimal docstring to the undocumented public symbol",
@@ -146,7 +146,7 @@ def can_fix(finding: Finding) -> bool:
     return finding.rule in FIXERS and not is_protected(finding.path)
 
 
-def propose(repo: Path, finding: Finding) -> Optional[Proposal]:
+def propose(repo: Path, finding: Finding) -> Proposal | None:
     """Build a proposal for ``finding``, or ``None`` when no fixer applies.
 
     Returning ``None`` is a real answer: it means this remediator declines to

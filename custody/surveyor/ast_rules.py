@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable
 
-from custody.findings import Finding, Pillar, Severity, finding_id, sort_findings
+from custody.findings import Finding, Pillar, Severity, anchor_ids, sort_findings
 
 DANGEROUS_CALLS = {
     "eval": (Severity.CRITICAL, "eval() executes arbitrary code"),
@@ -62,11 +62,16 @@ _BRANCHING_NODES = (
 )
 
 
-def parse_module(path: Path) -> Optional[ast.Module]:
-    """Parse ``path`` as Python, returning ``None`` when it will not parse."""
+def parse_module(path: Path) -> ast.Module | None:
+    """Parse ``path`` as Python, returning ``None`` when it will not parse.
+
+    Only parse failures return ``None``. An unreadable file raises ``OSError``
+    to the caller: a file that could not be read must be recorded as skipped,
+    never silently reported as clean.
+    """
     try:
         return ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
-    except (SyntaxError, ValueError, OSError):
+    except (SyntaxError, ValueError):
         return None
 
 
@@ -79,7 +84,7 @@ def _excerpt(path: Path, line: int) -> str:
     return lines[line - 1].strip() if 0 < line <= len(lines) else ""
 
 
-def import_aliases(tree: ast.Module) -> Dict[str, str]:
+def import_aliases(tree: ast.Module) -> dict[str, str]:
     """Map local names to the dotted names they were imported from.
 
     ``import os as o`` maps ``o`` to ``os``; ``from os import system as run``
@@ -91,7 +96,7 @@ def import_aliases(tree: ast.Module) -> Dict[str, str]:
     Only module-level and nested import statements are tracked. Dynamic
     rebinding (``f = os.system``) is not resolved, and is a known gap.
     """
-    aliases: Dict[str, str] = {}
+    aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -99,11 +104,11 @@ def import_aliases(tree: ast.Module) -> Dict[str, str]:
         elif isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 local = alias.asname or alias.name
-                aliases[local] = "%s.%s" % (node.module, alias.name)
+                aliases[local] = f"{node.module}.{alias.name}"
     return aliases
 
 
-def _resolve(name: str, aliases: Dict[str, str]) -> str:
+def _resolve(name: str, aliases: dict[str, str]) -> str:
     """Return ``name`` with its leading segment expanded through ``aliases``."""
     if not name:
         return name
@@ -111,22 +116,31 @@ def _resolve(name: str, aliases: Dict[str, str]) -> str:
     target = aliases.get(head)
     if target is None:
         return name
-    return "%s.%s" % (target, rest) if rest else target
+    return f"{target}.{rest}" if rest else target
 
 
 def _call_name(node: ast.Call) -> str:
-    """Return a dotted name for a call target, e.g. ``os.system``."""
-    func = node.func
+    """Return the full dotted name for a call target, e.g. ``os.system``.
+
+    The whole attribute chain is kept. An earlier version collapsed a deep
+    chain to its final attribute, so with ``from subprocess import run``
+    imported, an unrelated ``obj.client.run(...)`` resolved to
+    ``subprocess.run`` and produced a false positive. A chain whose base is
+    not a name (a call result, a subscript) has no static identity and
+    returns empty.
+    """
+    parts: list[str] = []
+    func: ast.expr = node.func
+    while isinstance(func, ast.Attribute):
+        parts.append(func.attr)
+        func = func.value
     if isinstance(func, ast.Name):
-        return func.id
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        return f"{func.value.id}.{func.attr}"
-    if isinstance(func, ast.Attribute):
-        return func.attr
+        parts.append(func.id)
+        return ".".join(reversed(parts))
     return ""
 
 
-def rule_shell_true(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
+def rule_shell_true(tree: ast.Module, rel: str, path: Path) -> list[Finding]:
     """Report subprocess calls that may hand a command to a shell.
 
     A literal ``shell=True`` is reported outright. A non-literal value -
@@ -135,7 +149,7 @@ def rule_shell_true(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
     shell is involved, and saying nothing would be indistinguishable from
     having checked and found it safe.
     """
-    found: List[Finding] = []
+    found: list[Finding] = []
     aliases = import_aliases(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -144,47 +158,69 @@ def rule_shell_true(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
             continue
         for keyword in node.keywords:
             if keyword.arg is None:
-                if _spread_may_carry_shell(keyword.value):
-                    found.append(
-                        _shell_finding(
-                            rel, node.lineno, path, "subprocess-shell-unresolved",
-                            Severity.MEDIUM,
-                            "Subprocess call spreads keyword arguments; a shell "
-                            "cannot be ruled out here.",
-                        )
-                    )
+                found.extend(_spread_shell_finding(keyword.value, rel, node.lineno, path))
                 continue
             if keyword.arg != "shell":
                 continue
-            value = keyword.value
-            if isinstance(value, ast.Constant):
-                if value.value is True:
-                    found.append(
-                        _shell_finding(
-                            rel, node.lineno, path, "subprocess-shell-true",
-                            Severity.CRITICAL,
-                            "Subprocess call uses shell=True; pass an argument "
-                            "list instead.",
-                        )
-                    )
-            else:
-                found.append(
-                    _shell_finding(
-                        rel, node.lineno, path, "subprocess-shell-unresolved",
-                        Severity.MEDIUM,
-                        "Subprocess call sets shell to a non-literal value; "
-                        "whether a shell runs cannot be determined here.",
-                    )
-                )
+            found.extend(_shell_value_finding(keyword.value, rel, node.lineno, path))
     return found
+
+
+def _shell_value_finding(value: ast.expr, rel: str, line: int, path: Path) -> list[Finding]:
+    """Classify one ``shell=`` value into a finding, or none for a falsy literal.
+
+    Any truthy constant is reported at full severity, not only the literal
+    ``True``: ``shell=1`` hands the command to a shell exactly as
+    ``shell=True`` does, and an earlier version that keyed on ``is True``
+    reported nothing for it - a one-character bypass of the rule.
+    """
+    if isinstance(value, ast.Constant):
+        if not value.value:
+            return []
+        return [
+            _shell_finding(
+                rel, line, path, "subprocess-shell-true", Severity.CRITICAL,
+                "Subprocess call sets shell to a truthy value; pass an "
+                "argument list instead.",
+            )
+        ]
+    return [
+        _shell_finding(
+            rel, line, path, "subprocess-shell-unresolved", Severity.MEDIUM,
+            "Subprocess call sets shell to a non-literal value; "
+            "whether a shell runs cannot be determined here.",
+        )
+    ]
+
+
+def _spread_shell_finding(value: ast.expr, rel: str, line: int, path: Path) -> list[Finding]:
+    """Classify a ``**`` spread that may carry a ``shell`` keyword.
+
+    A literal dict is read directly: a constant truthy ``shell`` value is the
+    real thing and reported at full severity rather than hedged, a constant
+    falsy one is safe, and anything else - including a non-literal dict -
+    cannot be ruled out and is reported as unresolved.
+    """
+    if isinstance(value, ast.Dict):
+        for key, item in zip(value.keys, value.values):
+            if isinstance(key, ast.Constant) and key.value == "shell":
+                return _shell_value_finding(item, rel, line, path)
+        return []
+    return [
+        _shell_finding(
+            rel, line, path, "subprocess-shell-unresolved", Severity.MEDIUM,
+            "Subprocess call spreads keyword arguments; a shell "
+            "cannot be ruled out here.",
+        )
+    ]
 
 
 def _shell_finding(
     rel: str, line: int, path: Path, rule: str, severity: Severity, message: str
 ) -> Finding:
-    """Build one shell-related finding."""
+    """Build one shell-related finding; its id is assigned by the anchor pass."""
     return Finding(
-        id=finding_id(rule, rel, line),
+        id="",
         rule=rule,
         pillar=Pillar.SECURITY,
         severity=severity,
@@ -195,27 +231,13 @@ def _shell_finding(
     )
 
 
-def _spread_may_carry_shell(value: ast.AST) -> bool:
-    """Return whether a ``**`` spread could introduce a shell keyword.
-
-    A literal dict is inspected directly; anything else is unknowable from
-    the syntax tree alone and is treated as possible.
-    """
-    if isinstance(value, ast.Dict):
-        for key in value.keys:
-            if isinstance(key, ast.Constant) and key.value == "shell":
-                return True
-        return False
-    return True
-
-
-def rule_dangerous_calls(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
+def rule_dangerous_calls(tree: ast.Module, rel: str, path: Path) -> list[Finding]:
     """Report calls to builtins and stdlib functions that execute input.
 
     Call targets are resolved through the module's import aliases first, so
     ``import os as o; o.system(x)`` is reported exactly like ``os.system(x)``.
     """
-    found: List[Finding] = []
+    found: list[Finding] = []
     aliases = import_aliases(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -231,7 +253,7 @@ def rule_dangerous_calls(tree: ast.Module, rel: str, path: Path) -> List[Finding
         severity, message = severity_message
         found.append(
             Finding(
-                id=finding_id(f"dangerous-call-{name}", rel, node.lineno),
+                id="",
                 rule=f"dangerous-call-{name.replace('.', '-')}",
                 pillar=Pillar.SECURITY,
                 severity=severity,
@@ -249,9 +271,9 @@ def _is_public(name: str) -> bool:
     return not name.startswith("_")
 
 
-def rule_missing_annotations(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
+def rule_missing_annotations(tree: ast.Module, rel: str, path: Path) -> list[Finding]:
     """Report public functions whose signature or return type is untyped."""
-    found: List[Finding] = []
+    found: list[Finding] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -265,7 +287,7 @@ def rule_missing_annotations(tree: ast.Module, rel: str, path: Path) -> List[Fin
             continue
         found.append(
             Finding(
-                id=finding_id("missing-annotations", rel, node.lineno),
+                id="",
                 rule="missing-annotations",
                 pillar=Pillar.QUALITY,
                 severity=Severity.LOW,
@@ -279,9 +301,9 @@ def rule_missing_annotations(tree: ast.Module, rel: str, path: Path) -> List[Fin
     return found
 
 
-def rule_missing_docstring(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
+def rule_missing_docstring(tree: ast.Module, rel: str, path: Path) -> list[Finding]:
     """Report public functions and classes with no docstring."""
-    found: List[Finding] = []
+    found: list[Finding] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
@@ -289,7 +311,7 @@ def rule_missing_docstring(tree: ast.Module, rel: str, path: Path) -> List[Findi
             continue
         found.append(
             Finding(
-                id=finding_id("missing-docstring", rel, node.lineno),
+                id="",
                 rule="missing-docstring",
                 pillar=Pillar.QUALITY,
                 severity=Severity.LOW,
@@ -315,9 +337,9 @@ def cyclomatic_complexity(node: ast.AST) -> int:
     return score
 
 
-def rule_complexity(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
+def rule_complexity(tree: ast.Module, rel: str, path: Path) -> list[Finding]:
     """Report functions whose branching exceeds :data:`MAX_COMPLEXITY`."""
-    found: List[Finding] = []
+    found: list[Finding] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -326,7 +348,7 @@ def rule_complexity(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
             continue
         found.append(
             Finding(
-                id=finding_id("high-complexity", rel, node.lineno),
+                id="",
                 rule="high-complexity",
                 pillar=Pillar.QUALITY,
                 severity=Severity.MEDIUM,
@@ -341,14 +363,14 @@ def rule_complexity(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
     return found
 
 
-def rule_bare_except(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
+def rule_bare_except(tree: ast.Module, rel: str, path: Path) -> list[Finding]:
     """Report bare ``except:`` handlers, which swallow control-flow exceptions."""
-    found: List[Finding] = []
+    found: list[Finding] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ExceptHandler) and node.type is None:
             found.append(
                 Finding(
-                    id=finding_id("bare-except", rel, node.lineno),
+                    id="",
                     rule="bare-except",
                     pillar=Pillar.QUALITY,
                     severity=Severity.MEDIUM,
@@ -361,7 +383,7 @@ def rule_bare_except(tree: ast.Module, rel: str, path: Path) -> List[Finding]:
     return found
 
 
-RULES: List[Callable[[ast.Module, str, Path], List[Finding]]] = [
+RULES: list[Callable[[ast.Module, str, Path], list[Finding]]] = [
     rule_shell_true,
     rule_dangerous_calls,
     rule_missing_annotations,
@@ -371,12 +393,17 @@ RULES: List[Callable[[ast.Module, str, Path], List[Finding]]] = [
 ]
 
 
-def survey_source(path: Path, rel: str) -> List[Finding]:
-    """Run every AST rule against one Python file."""
+def survey_source(path: Path, rel: str) -> list[Finding] | None:
+    """Run every AST rule against one Python file.
+
+    Returns ``None`` when the file does not parse as Python. That is a
+    distinct answer from an empty list: a file the rules could not examine
+    must be recorded as skipped by the caller, never counted as clean.
+    """
     tree = parse_module(path)
     if tree is None:
-        return []
-    found: List[Finding] = []
+        return None
+    found: list[Finding] = []
     for rule in RULES:
         found.extend(rule(tree, rel, path))
-    return sort_findings(found)
+    return sort_findings(anchor_ids(found))

@@ -14,12 +14,12 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Callable
 
 from custody import gitio
 from custody.auditor.verdict import Ruling
 from custody.findings import Finding
-from custody.harness import Proposal, CaseResult, run_case, summarise_run
+from custody.harness import CaseResult, Proposal, RunSummary, run_case, summarise_run
 from custody.ledger import Ledger
 from custody.remediator.contract import ScopeContract
 from custody.surveyor.runner import survey
@@ -74,7 +74,7 @@ class Scenario:
     expected_detector: str = ""
 
 
-def _contract(paths: List[str], finding_id: str, hypothesis: str) -> ScopeContract:
+def _contract(paths: list[str], finding_id: str, hypothesis: str) -> ScopeContract:
     """Build a scope contract for a scripted attempt."""
     return ScopeContract(
         finding_id=finding_id,
@@ -156,7 +156,7 @@ def underreport_spend(finding_id: str) -> Proposal:
     )
 
 
-SCENARIOS: List[Scenario] = [
+SCENARIOS: list[Scenario] = [
     Scenario("honest fix", honest_fix, Ruling.PROVEN),
     Scenario("deletes the test", delete_the_test, Ruling.REJECTED, "assertions-removed"),
     Scenario("silences the linter", silence_the_linter, Ruling.NOT_OBSERVED, "suppression-added"),
@@ -191,7 +191,7 @@ def target_finding(root: Path) -> Finding:
     raise RuntimeError("trial repository does not contain the expected finding")
 
 
-def run_trial(verbose: bool = True) -> Tuple[List[CaseResult], Dict[str, object]]:
+def run_trial(verbose: bool = True) -> tuple[list[CaseResult], RunSummary]:
     """Run every scenario against a fresh repository and report the outcomes."""
     root = Path(tempfile.mkdtemp(prefix="custody-trial-"))
     base = build_repo(root)
@@ -199,7 +199,7 @@ def run_trial(verbose: bool = True) -> Tuple[List[CaseResult], Dict[str, object]
     findings_before = survey(root).findings
     ledger = Ledger(root / ".custody" / "ledger.jsonl")
 
-    results: List[CaseResult] = []
+    results: list[CaseResult] = []
     for scenario in SCENARIOS:
         proposal = scenario.build(finding.id)
         result = run_case(
@@ -228,10 +228,10 @@ def main() -> int:
     results, summary = run_trial()
     print("")
     print("=" * 78)
-    for ruling, count in sorted(summary["rulings"].items()):
+    for ruling, count in sorted(summary.rulings.items()):
         print("  %-22s %d" % (ruling, count))
-    print("  ledger entries         %d" % summary["ledger_entries"])
-    print("  ledger recorded        %s" % summary["ledger_recorded"])
+    print("  ledger entries         %d" % summary.ledger_entries)
+    print(f"  ledger recorded        {summary.ledger_recorded}")
 
     expected_met = all(
         result.judgment.ruling is scenario.expected
@@ -242,7 +242,7 @@ def main() -> int:
         or scenario.expected_detector in {d.detector for d in result.judgment.detections}
         for result, scenario in zip(results, SCENARIOS)
     )
-    ok = expected_met and caught and bool(summary["ledger_recorded"])
+    ok = expected_met and caught and summary.ledger_recorded
     print("  result                 %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

@@ -13,11 +13,10 @@ says about it.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
 
 from custody.findings import Finding
 from custody.harness import Proposal
-from custody.llm import DEFAULT_MODEL, LLMError, call, extract_json
+from custody.llm import DEFAULT_MODEL, call, extract_json
 from custody.remediator.contract import ScopeContract
 
 MAX_FILE_CHARS = 40000
@@ -67,13 +66,12 @@ def build_prompt(repo: Path, finding: Finding) -> str:
     """Compose the request for one finding."""
     source = _read_source(repo, finding.path)
     return (
-        "Finding %s (%s, %s)\n"
-        "Location: %s\n"
-        "Message: %s\n"
-        "Evidence: %s\n\n"
-        "Current contents of %s:\n"
-        "```python\n%s\n```\n"
-        % (
+        "Finding {} ({}, {})\n"
+        "Location: {}\n"
+        "Message: {}\n"
+        "Evidence: {}\n\n"
+        "Current contents of {}:\n"
+        "```python\n{}\n```\n".format(
             finding.id, finding.rule, finding.severity.value,
             finding.location(), finding.message, finding.evidence or "(none)",
             finding.path, source,
@@ -82,7 +80,7 @@ def build_prompt(repo: Path, finding: Finding) -> str:
 
 
 def parse_proposal(
-    payload: Dict[str, object],
+    payload: dict[str, object],
     finding: Finding,
     measured_cost: float,
     cost_measurable: bool = True,
@@ -110,6 +108,11 @@ def parse_proposal(
         hypothesis=str(payload.get("hypothesis", "")).strip() or "(none given)",
         verification=str(payload.get("verification", "")).strip() or "(none given)",
     )
+    # The model has no channel through which to claim a spend figure, so the
+    # declared cost is pinned to the measured one here and the underreport
+    # comparison is vacuous for this remediator by construction. It exists for
+    # remediators that do declare - scripted or external ones - while
+    # cost-unverifiable covers the case where measurement itself failed.
     return Proposal(
         contract=contract,
         files={str(k): str(v) for k, v in files.items()},
@@ -124,7 +127,7 @@ def propose(
     finding: Finding,
     model: str = DEFAULT_MODEL,
     effort: str = "high",
-    key: Optional[str] = None,
+    key: str | None = None,
 ) -> Proposal:
     """Ask the model for a bounded fix and return it as a proposal.
 
@@ -147,7 +150,7 @@ def propose(
     )
 
 
-def available(key: Optional[str] = None) -> bool:
+def available(key: str | None = None) -> bool:
     """Return whether an API key is present, without making a request."""
     import os
 

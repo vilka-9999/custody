@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 class Severity(str, Enum):
@@ -26,7 +26,7 @@ class Severity(str, Enum):
         return _SEVERITY_ORDER.index(self)
 
 
-_SEVERITY_ORDER: List[Severity] = [
+_SEVERITY_ORDER: list[Severity] = [
     Severity.CRITICAL,
     Severity.HIGH,
     Severity.MEDIUM,
@@ -66,9 +66,9 @@ class Finding:
     line: int
     message: str
     evidence: str = ""
-    detail: Dict[str, Any] = field(default_factory=dict)
+    detail: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable view of the finding."""
         data = asdict(self)
         data["pillar"] = self.pillar.value
@@ -80,32 +80,75 @@ class Finding:
         return f"{self.path}:{self.line}" if self.line else self.path
 
 
-def sort_findings(findings: List[Finding]) -> List[Finding]:
+def sort_findings(findings: list[Finding]) -> list[Finding]:
     """Order findings by severity, then location, so runs are reproducible."""
     return sorted(findings, key=lambda f: (f.severity.rank, f.path, f.line, f.rule))
 
 
-def finding_id(rule: str, path: str, line: int, salt: str = "") -> str:
+def finding_id(rule: str, path: str, anchor: str, ordinal: int = 0) -> str:
     """Build a stable, human-readable id for a finding.
 
-    The id must not change between runs for the same underlying problem, so it
-    is derived only from the rule and its location, never from run order.
+    The id is derived from the rule, the file, and the *content* of the
+    offending line - never from its line number. An earlier version hashed
+    the line number, which meant inserting one blank line above a finding
+    changed its id: the contracted id vanished from a fresh survey and an
+    unfixed finding adjudicated as PROVEN. An id must survive the code
+    around it moving; only a change to the flagged content itself may
+    retire it.
+
+    ``ordinal`` disambiguates identical content appearing more than once in
+    the same file, counted in line order.
     """
     import hashlib
 
-    raw = f"{rule}|{path}|{line}|{salt}"
+    raw = f"{rule}|{path}|{anchor}|{ordinal}"
     return "CUS-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8].upper()
 
 
-def group_by_pillar(findings: List[Finding]) -> Dict[str, List[Finding]]:
+def anchor_ids(findings: list[Finding]) -> list[Finding]:
+    """Re-derive every finding's id from its content anchor.
+
+    The anchor is the finding's evidence (the stripped source line); findings
+    with no evidence fall back to their line number, which is the best
+    identity available for them. Duplicate anchors within one file take
+    ordinals in line order, so two identical dangerous calls get distinct,
+    stable ids.
+    """
+    from dataclasses import replace
+
+    counts: dict[tuple[str, str, str], int] = {}
+    anchored: list[Finding] = []
+    for finding in sorted(findings, key=lambda f: (f.path, f.line, f.rule)):
+        anchor = finding.evidence.strip() or f"@{finding.line}"
+        key = (finding.rule, finding.path, anchor)
+        ordinal = counts.get(key, 0)
+        counts[key] = ordinal + 1
+        new_id = finding_id(finding.rule, finding.path, anchor, ordinal)
+        anchored.append(replace(finding, id=new_id))
+    return anchored
+
+
+def instance_count(findings: list[Finding], rule: str, path: str) -> int:
+    """Count findings of ``rule`` in ``path``.
+
+    Ids retire when the flagged line's content changes, which a cosmetic
+    edit can cause without fixing anything. The instance count cannot be
+    moved that way: it drops only when the rule genuinely stops firing on
+    an occurrence, so adjudication requires both signals before calling a
+    finding cleared.
+    """
+    return sum(1 for f in findings if f.rule == rule and f.path == path)
+
+
+def group_by_pillar(findings: list[Finding]) -> dict[str, list[Finding]]:
     """Bucket findings by pillar name, preserving sort order within each."""
-    grouped: Dict[str, List[Finding]] = {p.value: [] for p in Pillar}
+    grouped: dict[str, list[Finding]] = {p.value: [] for p in Pillar}
     for finding in sort_findings(findings):
         grouped[finding.pillar.value].append(finding)
     return grouped
 
 
-def find_by_id(findings: List[Finding], finding_id_value: str) -> Optional[Finding]:
+def find_by_id(findings: list[Finding], finding_id_value: str) -> Finding | None:
     """Return the finding with ``finding_id_value``, or ``None``."""
     for finding in findings:
         if finding.id == finding_id_value:

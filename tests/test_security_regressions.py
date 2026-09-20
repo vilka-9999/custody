@@ -5,13 +5,14 @@ that the class of attack stays visible: in every case a guard existed and
 looked correct, but was applied to the wrong representation of the input.
 """
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from custody.auditor.detectors import DiffContext, detect_cost_underreport
 from custody.harness import _apply
-from custody.ledger import Ledger
+from custody.ledger import Ledger, LedgerError, canonical_json, digest
 from custody.remediator.contract import (
     ScopeContract,
     is_integrity_critical,
@@ -193,21 +194,60 @@ class LedgerTruncationTests(unittest.TestCase):
         self.assertTrue(report.intact)
         self.assertEqual(report.entries, 7)
 
-    def test_missing_marker_does_not_fail_an_intact_chain(self) -> None:
-        """A ledger written before markers existed still verifies."""
+    def test_missing_marker_is_itself_suspect(self) -> None:
+        """Deleting the marker must not reopen the truncation hole.
+
+        Truncating the ledger *and* removing the marker leaves a perfectly
+        self-consistent prefix; if a missing marker were accepted as intact,
+        one extra deleted file would defeat the whole truncation check. An
+        earlier version enshrined exactly that acceptance.
+        """
         Ledger(self.path).head_path.unlink()
-        self.assertTrue(Ledger(self.path).verify().intact)
+        report = Ledger(self.path).verify()
+        self.assertFalse(report.intact)
+        self.assertIn("head marker is missing", report.reason)
+
+    def test_empty_ledger_without_marker_is_intact(self) -> None:
+        """A ledger that never recorded anything has nothing to truncate."""
+        empty = Ledger(self.root / "fresh.jsonl")
+        self.assertTrue(empty.verify().intact)
+
+    def test_rewritten_tail_disagrees_with_marker_hash(self) -> None:
+        """A same-length re-chained tail fails against the recorded seal.
+
+        Count comparison alone accepts a forgery that replaces the final
+        entries with the same number of re-sealed ones; the marker's recorded
+        tail hash is what catches it.
+        """
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        entries = [json.loads(line) for line in lines]
+        forged = dict(entries[-1])
+        forged["action"] = "forged-action"
+        body = {k: v for k, v in forged.items() if k != "entry_hash"}
+        forged["entry_hash"] = digest(canonical_json(body))
+        lines[-1] = canonical_json(forged)
+        self.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        report = Ledger(self.path).verify()
+        self.assertFalse(report.intact)
+
+    def test_malformed_line_reports_broken_not_traceback(self) -> None:
+        """Corruption that breaks the entry schema is a verdict, not a crash."""
+        raw = self.path.read_text(encoding="utf-8")
+        self.path.write_text(raw.replace('"action"', '"bction"', 1), encoding="utf-8")
+        with self.assertRaises(LedgerError):
+            Ledger(self.path)
 
 
 class CostBlindSpotTests(unittest.TestCase):
     """An unpriced model must not silently switch the cost check off."""
 
     def _context(self, **kwargs: object) -> DiffContext:
-        """Build a context with cost fields set."""
-        base = dict(
-            contract=ScopeContract("C", ["a.py"], "h", "v"),
-            changed=["a.py"], before={"a.py": "x"}, after={"a.py": "y"},
-        )
+        """Build a context with cost fields set; spend is priced by default."""
+        base = {
+            "contract": ScopeContract("C", ["a.py"], "h", "v"),
+            "changed": ["a.py"], "before": {"a.py": "x"}, "after": {"a.py": "y"},
+            "cost_measurable": True,
+        }
         base.update(kwargs)
         return DiffContext(**base)
 
@@ -268,7 +308,7 @@ class AliasBlindnessTests(unittest.TestCase):
         }
 
     def test_aliased_module_is_resolved(self) -> None:
-        """import os as o still reports o.system."""
+        """Import os as o still reports o.system."""
         self.assertIn(
             "dangerous-call-os-system",
             self._rules('import os as o\n\n\ndef f(c: str) -> int:\n    """D."""\n'
@@ -276,7 +316,7 @@ class AliasBlindnessTests(unittest.TestCase):
         )
 
     def test_aliased_symbol_is_resolved(self) -> None:
-        """from os import system as run still reports run()."""
+        """From os import system as run still reports run()."""
         self.assertIn(
             "dangerous-call-os-system",
             self._rules('from os import system as run\n\n\ndef f(c: str) -> int:\n'

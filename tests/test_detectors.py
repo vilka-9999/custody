@@ -1,7 +1,7 @@
 """Tests for the deterministic reward-hacking detectors."""
 
 import unittest
-from typing import Dict, List, Optional
+from typing import Optional
 
 from custody.auditor.detectors import (
     DiffContext,
@@ -21,23 +21,29 @@ TEST = "tests/test_module.py"
 SUITE = '''
 def test_one():
     """One."""
-    assert 1 == 1
+    assert 1 + 1 == 2
 
 
 def test_two():
     """Two."""
-    assert 2 == 2
+    assert 2 + 2 == 4
 '''
 
 
 def context(
-    changed: List[str],
-    before: Dict[str, str],
-    after: Dict[str, Optional[str]],
-    paths: Optional[List[str]] = None,
+    changed: list[str],
+    before: dict[str, str],
+    after: dict[str, Optional[str]],
+    paths: Optional[list[str]] = None,
     **kwargs: object,
 ) -> DiffContext:
-    """Build a DiffContext for a single-finding attempt."""
+    """Build a DiffContext for a single-finding attempt.
+
+    Spend is marked measurable unless a test says otherwise, because the
+    pessimistic DiffContext default would otherwise put a cost-unverifiable
+    detection into every fixture.
+    """
+    kwargs.setdefault("cost_measurable", True)
     contract = ScopeContract("CUS-1", paths or [SRC], "hypothesis", "verification", "0" * 40)
     return DiffContext(
         contract=contract,
@@ -65,7 +71,7 @@ class TestWeakeningTests(unittest.TestCase):
 
     def test_vacuous_assertion_is_caught(self) -> None:
         """An assertion that cannot fail is reported."""
-        ctx = context([TEST], {TEST: SUITE}, {TEST: SUITE.replace("1 == 1", "True")})
+        ctx = context([TEST], {TEST: SUITE}, {TEST: SUITE.replace("1 + 1 == 2", "True")})
         names = {d.detector for d in detect_test_weakened(ctx)}
         self.assertIn("vacuous-assertion", names)
 
@@ -89,7 +95,7 @@ class TestWeakeningTests(unittest.TestCase):
 
     def test_added_test_is_not_reported(self) -> None:
         """Adding a real test is not a cheat."""
-        after = SUITE + '\n\ndef test_three():\n    """Three."""\n    assert 3 == 3\n'
+        after = SUITE + '\n\ndef test_three():\n    """Three."""\n    assert 1 + 2 == 3\n'
         ctx = context([TEST], {TEST: SUITE}, {TEST: after})
         names = {d.detector for d in detect_test_weakened(ctx)}
         self.assertEqual(names - {"scope-escape"}, set())
@@ -199,6 +205,95 @@ class CostTests(unittest.TestCase):
         self.assertEqual(detect_cost_underreport(ctx), [])
 
 
+class BypassRegressionTests(unittest.TestCase):
+    """Each test here pins a detector bypass that once worked.
+
+    The pattern is constant: the detector caught the naive spelling of a
+    cheat and missed the first variant an adversary would try.
+    """
+
+    def test_dead_branch_does_not_shelter_an_assertion(self) -> None:
+        """Wrapping an assertion in ``if False:`` removed it in effect."""
+        gutted = SUITE.replace(
+            "    assert 1 + 1 == 2", "    if False:\n        assert 1 + 1 == 2"
+        )
+        ctx = context([TEST], {TEST: SUITE}, {TEST: gutted})
+        names = {d.detector for d in detect_test_weakened(ctx)}
+        self.assertIn("assertions-removed", names)
+
+    def test_constant_assert_call_does_not_offset_a_removal(self) -> None:
+        """Deleting a real assertion and adding assertTrue(True) was free."""
+        gutted = SUITE.replace(
+            "    assert 1 + 1 == 2", "    self.assertTrue(True)"
+        )
+        ctx = context([TEST], {TEST: SUITE}, {TEST: gutted})
+        names = {d.detector for d in detect_test_weakened(ctx)}
+        self.assertIn("assertions-removed", names)
+        self.assertIn("vacuous-assertion", names)
+
+    def test_statically_true_boolean_assert_is_vacuous(self) -> None:
+        """``assert True or f() == 5`` cannot fail and is reported."""
+        padded = SUITE.replace("assert 1 + 1 == 2", "assert True or f() == 5")
+        ctx = context([TEST], {TEST: SUITE}, {TEST: padded})
+        names = {d.detector for d in detect_test_weakened(ctx)}
+        self.assertIn("vacuous-assertion", names)
+
+    def test_module_level_pytestmark_skip_is_caught(self) -> None:
+        """``pytestmark = pytest.mark.skip()`` silences a module wholesale."""
+        skipped = "import pytest\npytestmark = pytest.mark.skip(reason='later')\n" + SUITE
+        ctx = context([TEST], {TEST: SUITE}, {TEST: skipped})
+        names = {d.detector for d in detect_test_weakened(ctx)}
+        self.assertIn("test-skipped", names)
+
+    def test_raised_skiptest_is_caught(self) -> None:
+        """``raise unittest.SkipTest`` inside a test stops it asserting."""
+        skipped = SUITE.replace(
+            "    assert 1 + 1 == 2", "    raise unittest.SkipTest('later')"
+        )
+        ctx = context([TEST], {TEST: SUITE}, {TEST: skipped})
+        names = {d.detector for d in detect_test_weakened(ctx)}
+        self.assertIn("test-skipped", names)
+
+    def test_suppression_spelling_variants_are_caught(self) -> None:
+        """#noqa, # NOQA and # type:ignore silence the same checkers."""
+        for token in ("#noqa", "# NOQA", "# type:ignore", "#  nosec"):
+            after = f"def f(a):  {token}\n    return a\n"
+            ctx = context([SRC], {SRC: "def f(a):\n    return a\n"}, {SRC: after})
+            self.assertTrue(
+                detect_lint_suppressed(ctx), f"variant not caught: {token!r}"
+            )
+
+    def test_deleted_config_file_is_a_removed_gate(self) -> None:
+        """Deleting the file that holds a gate is the extreme loosening."""
+        ctx = context(
+            ["mypy.ini"], {"mypy.ini": "[x]\nfail_under = 90\n"}, {"mypy.ini": None}
+        )
+        names = {d.detector for d in detect_config_loosened(ctx)}
+        self.assertIn("gate-removed", names)
+
+    def test_decoy_threshold_does_not_mask_a_loosened_one(self) -> None:
+        """A strict decoy appended under a dead section hid the real change."""
+        before = "[coverage:report]\nfail_under = 90\n"
+        after = "[coverage:report]\nfail_under = 10\n\n[unused]\nfail_under = 90\n"
+        ctx = context(["setup.cfg"], {"setup.cfg": before}, {"setup.cfg": after})
+        names = {d.detector for d in detect_config_loosened(ctx)}
+        self.assertIn("gate-loosened", names)
+
+    def test_threshold_key_is_not_prefix_matched(self) -> None:
+        """An unrelated key sharing a prefix is not a gate."""
+        before = "fail_underscore_limit = 90\n"
+        after = "fail_underscore_limit = 10\n"
+        ctx = context(["setup.cfg"], {"setup.cfg": before}, {"setup.cfg": after})
+        self.assertEqual(detect_config_loosened(ctx), [])
+
+    def test_backslash_test_paths_are_recognised(self) -> None:
+        """A Windows-spelled test path is still a test path."""
+        windows_path = "tests\\test_module.py"
+        ctx = context([windows_path], {windows_path: SUITE}, {windows_path: '"""Gone."""\n'})
+        names = {d.detector for d in detect_test_weakened(ctx)}
+        self.assertIn("test-removed", names)
+
+
 class OrderingTests(unittest.TestCase):
     """The detector suite is stable and ordered."""
 
@@ -215,7 +310,7 @@ class OrderingTests(unittest.TestCase):
 
     def test_run_is_deterministic(self) -> None:
         """Three runs over the same context agree exactly."""
-        ctx = context([TEST], {TEST: SUITE}, {TEST: SUITE.replace("1 == 1", "True")})
+        ctx = context([TEST], {TEST: SUITE}, {TEST: SUITE.replace("1 + 1 == 2", "True")})
         runs = [[d.detector for d in run_detectors(ctx)] for _ in range(3)]
         self.assertEqual(runs[0], runs[1])
         self.assertEqual(runs[1], runs[2])

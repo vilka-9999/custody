@@ -12,9 +12,39 @@ import html
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any
 
-from custody.ledger import Entry, Ledger
+from custody.ledger import ChainReport, Entry, Ledger, LedgerError
+
+ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+"""Host headers the console answers.
+
+The server binds to loopback, but a malicious page can point a hostname it
+controls at 127.0.0.1 and read the ledger cross-origin - DNS rebinding.
+A request whose Host header is not a loopback name did not come from the
+operator's own browser bar and is refused.
+"""
+
+
+def _host_allowed(host: str) -> bool:
+    """Return whether a request's Host header names this machine's loopback."""
+    name = host.strip().lower()
+    name = "[::1]" if name.startswith("[::1]") else name.split(":", 1)[0]
+    return name in ALLOWED_HOSTS
+
+
+def _read_safely(ledger: Ledger) -> tuple[list[Entry], ChainReport]:
+    """Read the ledger, reporting a malformed file as a broken chain.
+
+    A corrupt line used to crash the request handler, which made that class
+    of tampering render the console unreachable instead of rendering the
+    broken banner - the one page state this view must always be able to show.
+    """
+    try:
+        entries = list(ledger.read())
+    except LedgerError as exc:
+        return [], ChainReport(entries=0, intact=False, reason=str(exc))
+    return entries, ledger.verify()
 
 DEFAULT_PORT = 8765
 
@@ -66,10 +96,10 @@ def _esc(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
-def summarise(entries: List[Entry]) -> Dict[str, object]:
+def summarise(entries: list[Entry]) -> dict[str, Any]:
     """Return headline counts derived only from recorded entries."""
-    rulings: Dict[str, int] = {}
-    files: set = set()
+    rulings: dict[str, int] = {}
+    files: set[str] = set()
     for entry in entries:
         if entry.verdict:
             rulings[entry.verdict] = rulings.get(entry.verdict, 0) + 1
@@ -83,37 +113,68 @@ def summarise(entries: List[Entry]) -> Dict[str, object]:
     }
 
 
+def _open_ledger(path: Path) -> Ledger | ChainReport:
+    """Open the ledger, or return the broken-chain report it deserves.
+
+    Opening resumes from the existing file, so a corrupt ledger raises during
+    construction; the console must survive that and say so on the page.
+    """
+    try:
+        return Ledger(path)
+    except LedgerError as exc:
+        return ChainReport(entries=0, intact=False, reason=str(exc))
+
+
+def _chain_banner(report: ChainReport) -> str:
+    """Render the verification banner for the top of the page."""
+    if report.intact:
+        return (
+            '<div class="chain ok">Chain intact &mdash; '
+            f"{report.entries} entries verified</div>"
+        )
+    where = f"at entry {report.broken_at} " if report.broken_at is not None else ""
+    return f'<div class="chain bad">CHAIN BROKEN {_esc(where)}&mdash; {_esc(report.reason)}</div>'
+
+
+def render_broken(report: ChainReport) -> str:
+    """Render the one page state that must always be reachable."""
+    chain = _chain_banner(report)
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        '<meta name=viewport content="width=device-width,initial-scale=1">'
+        f"<title>Custody</title><style>{STYLE}</style></head><body><div class=wrap>"
+        "<h1>Custody</h1>"
+        '<p class="sub">Chain of custody for machine-written code. '
+        "This view renders the ledger; it does not recompute any verdict.</p>"
+        f"{chain}</div></body></html>"
+    )
+
+
 def render(ledger: Ledger) -> str:
     """Render the whole ledger as one self-contained HTML page."""
-    entries = list(ledger.read())
-    report = ledger.verify()
+    entries, report = _read_safely(ledger)
     stats = summarise(entries)
-
-    chain = (
-        '<div class="chain ok">Chain intact &mdash; %d entries verified</div>' % report.entries
-        if report.intact
-        else '<div class="chain bad">CHAIN BROKEN at entry %s &mdash; %s</div>'
-        % (_esc(report.broken_at), _esc(report.reason))
-    )
+    chain = _chain_banner(report)
 
     tiles = [
         ("%d" % stats["entries"], "ledger entries"),
         ("%d" % stats["actors"], "actors"),
         ("%d" % stats["files"], "files touched"),
-        ("$%.4f" % stats["spend"], "attributed spend"),
+        ("${:.4f}".format(stats["spend"]), "attributed spend"),
     ]
     for ruling, count in sorted(stats["rulings"].items()):
         tiles.append(("%d" % count, ruling.replace("_", " ").lower()))
     tile_html = "".join(
-        '<div class="stat"><b>%s</b><span>%s</span></div>' % (_esc(v), _esc(label))
+        f'<div class="stat"><b>{_esc(v)}</b><span>{_esc(label)}</span></div>'
         for v, label in tiles
     )
 
     rows = []
     for entry in reversed(entries):
         verdict = (
-            '<span class="v %s">%s</span>'
-            % (RULING_CLASS.get(entry.verdict, ""), _esc(entry.verdict))
+            '<span class="v {}">{}</span>'.format(
+                RULING_CLASS.get(entry.verdict, ""), _esc(entry.verdict)
+            )
             if entry.verdict
             else ""
         )
@@ -126,7 +187,7 @@ def render(ledger: Ledger) -> str:
             % (
                 entry.seq, _esc(entry.actor), _esc(entry.action), _esc(entry.target),
                 verdict,
-                "$%.4f" % entry.cost_usd if entry.cost_usd else "",
+                f"${entry.cost_usd:.4f}" if entry.cost_usd else "",
                 _esc(touched[:70]),
             )
         )
@@ -134,16 +195,18 @@ def render(ledger: Ledger) -> str:
     return (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width,initial-scale=1">'
-        "<title>Custody</title><style>%s</style></head><body><div class=wrap>"
+        "<title>Custody</title><style>{}</style></head><body><div class=wrap>"
         "<h1>Custody</h1>"
         '<p class="sub">Chain of custody for machine-written code. '
         "This view renders the ledger; it does not recompute any verdict.</p>"
-        "%s<div class=stats>%s</div>"
+        "{}<div class=stats>{}</div>"
         "<table><thead><tr><th>#</th><th>actor</th><th>action</th><th>target</th>"
         "<th>ruling</th><th class=hide-sm>cost</th><th class=hide-sm>files</th>"
-        "</tr></thead><tbody>%s</tbody></table>"
-        "</div></body></html>"
-        % (STYLE, chain, tile_html, "".join(rows) or "<tr><td colspan=7>No entries yet.</td></tr>")
+        "</tr></thead><tbody>{}</tbody></table>"
+        "</div></body></html>".format(
+            STYLE, chain, tile_html,
+            "".join(rows) or "<tr><td colspan=7>No entries yet.</td></tr>",
+        )
     )
 
 
@@ -154,23 +217,34 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
         """Serve the dashboard, the JSON feed, or a 404."""
-        ledger = Ledger(self.ledger_path)
+        if not _host_allowed(self.headers.get("Host", "")):
+            self.send_error(403, "console answers loopback host names only")
+            return
+        ledger = _open_ledger(self.ledger_path)
         if self.path.startswith("/ledger.json"):
-            report = ledger.verify()
+            entries: list[Entry] = []
+            if isinstance(ledger, ChainReport):
+                report = ledger
+            else:
+                entries, report = _read_safely(ledger)
             body = json.dumps(
                 {
                     "intact": report.intact,
                     "broken_at": report.broken_at,
+                    "reason": report.reason,
                     "entries": [
-                        dict(entry.body(), entry_hash=entry.entry_hash)
-                        for entry in ledger.read()
+                        dict(entry.body(), entry_hash=entry.entry_hash) for entry in entries
                     ],
                 },
                 indent=2, sort_keys=True,
             ).encode("utf-8")
             self._send(body, "application/json")
         elif self.path in ("/", "/index.html"):
-            self._send(render(ledger).encode("utf-8"), "text/html; charset=utf-8")
+            page = (
+                render_broken(ledger) if isinstance(ledger, ChainReport)
+                else render(ledger)
+            )
+            self._send(page.encode("utf-8"), "text/html; charset=utf-8")
         else:
             self.send_error(404)
 
@@ -183,7 +257,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt: str, *args: object) -> None:
+    def log_message(self, _fmt: str, *_args: object) -> None:
         """Suppress per-request logging, which is noise during a demo."""
         return
 
@@ -193,7 +267,7 @@ def serve(ledger_path: Path, port: int = DEFAULT_PORT) -> None:
     ConsoleHandler.ledger_path = Path(ledger_path)
     server = HTTPServer(("127.0.0.1", port), ConsoleHandler)
     print("Custody console: http://127.0.0.1:%d" % port)
-    print("Reading %s (press Ctrl-C to stop)" % ledger_path)
+    print(f"Reading {ledger_path} (press Ctrl-C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

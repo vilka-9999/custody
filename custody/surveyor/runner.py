@@ -8,13 +8,13 @@ compare the two runs honestly.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
 
 from custody.findings import Finding, Pillar, sort_findings
 from custody.surveyor.ast_rules import survey_source
-from custody.surveyor.secrets import survey_secrets
+from custody.surveyor.secrets import MAX_SCAN_BYTES, survey_secrets
 
 EXCLUDED_DIRS = frozenset(
     {
@@ -30,6 +30,22 @@ TEXT_SUFFIXES = frozenset(
 )
 """Suffixes scanned for committed credentials."""
 
+DOTFILE_PREFIXES = (".env",)
+"""File names collected by name rather than suffix.
+
+``Path(".env").suffix`` is empty, so a suffix rule alone never scans the
+single most common place a credential is committed. ``.env`` and variants
+like ``.env.local`` are matched on the name instead.
+"""
+
+
+def _is_scannable(path: Path) -> bool:
+    """Return whether ``path`` is a text file the survey examines."""
+    if path.suffix.lower() in TEXT_SUFFIXES:
+        return True
+    name = path.name.lower()
+    return any(name == prefix or name.startswith(prefix + ".") for prefix in DOTFILE_PREFIXES)
+
 MAX_FILES = 5000
 """Upper bound on files visited, so a pathological tree cannot hang a run."""
 
@@ -42,13 +58,13 @@ class SurveyResult:
     survey that visited nothing must never be mistaken for a clean repository.
     """
 
-    findings: List[Finding] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
     files_scanned: int = 0
     python_files: int = 0
-    skipped: List[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
     complete: bool = True
 
-    def by_pillar(self) -> Dict[str, int]:
+    def by_pillar(self) -> dict[str, int]:
         """Return a count of findings per pillar, including empty pillars."""
         counts = {pillar.value: 0 for pillar in Pillar}
         for finding in self.findings:
@@ -64,37 +80,47 @@ class SurveyResult:
             )
         counts = self.by_pillar()
         detail = ", ".join("%s %d" % (name.lower(), n) for name, n in sorted(counts.items()))
-        return "%d files scanned (%d Python); %d findings (%s)" % (
+        line = "%d files scanned (%d Python); %d findings (%s)" % (
             self.files_scanned, self.python_files, len(self.findings), detail,
         )
+        if self.skipped:
+            line += "; %d path(s) skipped - not examined, not clean" % len(self.skipped)
+        return line
 
 
-def iter_files(root: Path, excluded: Sequence[str] = ()) -> List[Path]:
-    """Return every scannable file under ``root`` in a stable order."""
+def iter_files(root: Path, excluded: Sequence[str] = ()) -> tuple[list[Path], bool]:
+    """Return every scannable file under ``root`` in a stable order.
+
+    The second element reports whether the walk was truncated at
+    :data:`MAX_FILES` with scannable files still remaining. A tree that holds
+    exactly the limit is complete, not truncated; an earlier version inferred
+    truncation from the count alone and misreported that case.
+    """
     skip = EXCLUDED_DIRS | set(excluded)
-    collected: List[Path] = []
+    collected: list[Path] = []
     for path in sorted(root.rglob("*")):
-        if len(collected) >= MAX_FILES:
-            break
         if not path.is_file():
             continue
         if any(part in skip for part in path.parts):
             continue
-        if path.suffix.lower() in TEXT_SUFFIXES:
-            collected.append(path)
-    return collected
+        if not _is_scannable(path):
+            continue
+        if len(collected) >= MAX_FILES:
+            return collected, True
+        collected.append(path)
+    return collected, False
 
 
-def survey(root: Path, excluded: Optional[Sequence[str]] = None) -> SurveyResult:
+def survey(root: Path, excluded: Sequence[str] | None = None) -> SurveyResult:
     """Run every deterministic rule over the repository at ``root``."""
     root = Path(root).resolve()
     if not root.is_dir():
-        return SurveyResult(complete=False, skipped=["%s is not a directory" % root])
+        return SurveyResult(complete=False, skipped=[f"{root} is not a directory"])
 
-    findings: List[Finding] = []
-    skipped: List[str] = []
+    findings: list[Finding] = []
+    skipped: list[str] = []
     python_files = 0
-    files = iter_files(root, excluded or ())
+    files, truncated = iter_files(root, excluded or ())
 
     for path in files:
         try:
@@ -103,17 +129,24 @@ def survey(root: Path, excluded: Optional[Sequence[str]] = None) -> SurveyResult
             skipped.append(str(path))
             continue
         try:
+            if path.stat().st_size > MAX_SCAN_BYTES:
+                skipped.append(f"{rel} (exceeds {MAX_SCAN_BYTES} bytes; not scanned)")
+                continue
             findings.extend(survey_secrets(path, rel))
-            if path.suffix == ".py":
+            if path.suffix.lower() == ".py":
                 python_files += 1
-                findings.extend(survey_source(path, rel))
+                source_findings = survey_source(path, rel)
+                if source_findings is None:
+                    skipped.append(f"{rel} (does not parse as Python; AST rules did not run)")
+                else:
+                    findings.extend(source_findings)
         except OSError as exc:
-            skipped.append("%s (%s)" % (rel, exc))
+            skipped.append(f"{rel} ({exc})")
 
     return SurveyResult(
         findings=sort_findings(findings),
         files_scanned=len(files),
         python_files=python_files,
         skipped=skipped,
-        complete=len(files) < MAX_FILES,
+        complete=not truncated,
     )

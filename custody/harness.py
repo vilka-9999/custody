@@ -13,9 +13,10 @@ territory, and reverts in full on any failed gate.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
 
 from custody import gitio
 from custody.auditor.detectors import DiffContext, run_detectors
@@ -24,7 +25,7 @@ from custody.findings import Finding
 from custody.ledger import Ledger
 from custody.remediator.contract import (
     ScopeContract,
-    ScopeViolation,
+    ScopeViolationError,
     is_integrity_critical,
     is_repo_relative,
     validate_contract,
@@ -36,7 +37,7 @@ PROTECTED_BRANCHES = frozenset({"main", "master", "trunk", "develop"})
 """Branches the harness refuses to modify without an explicit override."""
 
 
-class HarnessRefusal(RuntimeError):
+class HarnessRefusalError(RuntimeError):
     """Raised when preconditions for a safe run are not met."""
 
 
@@ -54,11 +55,11 @@ class Proposal:
     """
 
     contract: ScopeContract
-    files: Dict[str, str]
+    files: dict[str, str]
     declared_cost_usd: float = 0.0
     measured_cost_usd: float = 0.0
     cost_measurable: bool = True
-    notes: Dict[str, str] = field(default_factory=dict)
+    notes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -75,30 +76,32 @@ def preflight(repo: Path, allow_default_branch: bool = False) -> str:
     """Verify the repository is safe to modify and return the base SHA.
 
     Raises:
-        HarnessRefusal: If the tree is dirty, untracked by git, or checked out
-            on a default branch. Refusing here is cheaper than reverting later,
-            and a dirty tree makes the diff meaningless as evidence.
+        HarnessRefusalError: If the tree is dirty, untracked by git, or
+            checked out on a default branch. Refusing here is cheaper than
+            reverting later, and a dirty tree makes the diff meaningless as
+            evidence.
     """
     repo = Path(repo)
     if not gitio.is_repo(repo):
-        raise HarnessRefusal("%s is not a git repository" % repo)
+        raise HarnessRefusalError(f"{repo} is not a git repository")
     dirty = gitio.dirty_paths(repo)
     if dirty:
-        raise HarnessRefusal(
-            "working tree has uncommitted changes (%s); commit or stash them first"
-            % ", ".join(dirty[:4])
+        raise HarnessRefusalError(
+            "working tree has uncommitted changes ({}); commit or stash them first".format(
+                ", ".join(dirty[:4])
+            )
         )
     branch = gitio.current_branch(repo)
     if branch in PROTECTED_BRANCHES and not allow_default_branch:
-        raise HarnessRefusal(
-            "refusing to modify the %r branch; check out a scratch branch first" % branch
+        raise HarnessRefusalError(
+            f"refusing to modify the {branch!r} branch; check out a scratch branch first"
         )
     return gitio.head_sha(repo)
 
 
-def _capture(repo: Path, paths: Sequence[str]) -> Dict[str, str]:
+def _capture(repo: Path, paths: Sequence[str]) -> dict[str, str]:
     """Read the current contents of ``paths``, skipping ones that do not exist."""
-    captured: Dict[str, str] = {}
+    captured: dict[str, str] = {}
     for rel in paths:
         candidate = repo / rel
         try:
@@ -109,7 +112,7 @@ def _capture(repo: Path, paths: Sequence[str]) -> Dict[str, str]:
     return captured
 
 
-def _apply(repo: Path, files: Dict[str, str]) -> Tuple[List[str], List[str]]:
+def _apply(repo: Path, files: dict[str, str]) -> tuple[list[str], list[str]]:
     """Write proposed file contents, returning what was written and what was refused.
 
     Every decision here is made against the *resolved* repository-relative
@@ -132,8 +135,8 @@ def _apply(repo: Path, files: Dict[str, str]) -> Tuple[List[str], List[str]]:
     deliberate: detection is the point, but it only means anything while the
     evidence is beyond the agent's reach.
     """
-    written: List[str] = []
-    refused: List[str] = []
+    written: list[str] = []
+    refused: list[str] = []
     root = repo.resolve()
 
     for rel, content in sorted(files.items()):
@@ -165,7 +168,7 @@ def run_case(
     proposal: Proposal,
     ledger: Ledger,
     base_sha: str,
-    findings_before: List[Finding],
+    findings_before: list[Finding],
     commit: bool = True,
 ) -> CaseResult:
     """Apply one proposal, verify it, rule on it, and keep or revert it."""
@@ -178,10 +181,10 @@ def run_case(
 
     try:
         validate_contract(proposal.contract)
-    except ScopeViolation as exc:
+    except ScopeViolationError as exc:
         judgment = Judgment(
             finding.id, Ruling.REJECTED,
-            "Contract claimed territory it may not have: %s" % exc,
+            f"Contract claimed territory it may not have: {exc}",
         )
         ledger.append(
             "auditor", "case.ruled", target=finding.id, verdict=judgment.ruling.value,
@@ -195,6 +198,45 @@ def run_case(
         cost_usd=proposal.measured_cost_usd,
     )
 
+    # From the first write onward, an unexpected exception must not strand the
+    # agent's changes on disk: the tree is reverted, the abort is recorded, and
+    # the error still propagates. An attempt that died halfway is not evidence
+    # of anything, but files it wrote surviving un-adjudicated would be worse.
+    try:
+        return _adjudicate_applied(
+            repo, finding, proposal, ledger, base_sha, findings_before, commit
+        )
+    except Exception as exc:
+        _abort_case(repo, finding, ledger, base_sha, exc)
+        raise
+
+
+def _abort_case(
+    repo: Path, finding: Finding, ledger: Ledger, base_sha: str, exc: Exception
+) -> None:
+    """Best-effort revert and record after an attempt died mid-flight."""
+    try:
+        gitio.restore_to(repo, base_sha)
+        reverted = True
+    except gitio.GitError:
+        reverted = False
+    with contextlib.suppress(OSError):
+        ledger.append(
+            "harness", "case.aborted", target=finding.id,
+            detail={"error": str(exc), "reverted": reverted},
+        )
+
+
+def _adjudicate_applied(
+    repo: Path,
+    finding: Finding,
+    proposal: Proposal,
+    ledger: Ledger,
+    base_sha: str,
+    findings_before: list[Finding],
+    commit: bool,
+) -> CaseResult:
+    """Write, verify, rule on, and keep or revert one validated proposal."""
     before = _capture(repo, list(proposal.files.keys()))
     written, refused = _apply(repo, proposal.files)
     # The ledger lives inside the repository but is written by the harness, not
@@ -245,7 +287,7 @@ def run_case(
     sha = ""
     if keep:
         try:
-            sha = gitio.commit_all(repo, "custody: fix %s (%s)" % (finding.id, finding.rule))
+            sha = gitio.commit_all(repo, f"custody: fix {finding.id} ({finding.rule})")
         except gitio.GitError:
             keep = False
     if not keep:
@@ -262,21 +304,46 @@ def run_case(
     return CaseResult(finding, judgment, committed=keep, sha=sha)
 
 
-def summarise_run(results: List[CaseResult], ledger: Ledger) -> Dict[str, object]:
-    """Return counts that distinguish what was checked from what was found."""
-    counts: Dict[str, int] = {ruling.value: 0 for ruling in Ruling}
+@dataclass(frozen=True)
+class RunSummary:
+    """Counts that distinguish what was checked from what was found."""
+
+    cases: int
+    committed: int
+    rulings: dict[str, int]
+    spend_usd: float
+    ledger_intact: bool
+    ledger_entries: int
+    ledger_recorded: bool
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serialisable view for the ledger."""
+        return {
+            "cases": self.cases,
+            "committed": self.committed,
+            "rulings": dict(self.rulings),
+            "spend_usd": self.spend_usd,
+            "ledger_intact": self.ledger_intact,
+            "ledger_entries": self.ledger_entries,
+            "ledger_recorded": self.ledger_recorded,
+        }
+
+
+def summarise_run(results: list[CaseResult], ledger: Ledger) -> RunSummary:
+    """Summarise a run without overstating what the ledger holds."""
+    counts: dict[str, int] = {ruling.value: 0 for ruling in Ruling}
     for result in results:
         counts[result.judgment.ruling.value] += 1
     report = ledger.verify()
     # An empty chain verifies as intact, so entry count is reported beside it.
     # A run that adjudicated cases but recorded nothing is a destroyed audit
     # trail, not a clean result, and must never read as one.
-    return {
-        "cases": len(results),
-        "committed": sum(1 for r in results if r.committed),
-        "rulings": counts,
-        "spend_usd": ledger.total_cost(),
-        "ledger_intact": report.intact,
-        "ledger_entries": report.entries,
-        "ledger_recorded": report.intact and (report.entries > 0 or not results),
-    }
+    return RunSummary(
+        cases=len(results),
+        committed=sum(1 for r in results if r.committed),
+        rulings=counts,
+        spend_usd=ledger.total_cost(),
+        ledger_intact=report.intact,
+        ledger_entries=report.entries,
+        ledger_recorded=report.intact and (report.entries > 0 or not results),
+    )

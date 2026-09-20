@@ -3,8 +3,8 @@
 ## Running everything
 
 ```bash
-python -m unittest discover -s tests   # 114 tests, stdlib only
-python -m custody eval                 # auditor vs. 12 ground-truth fixtures
+python -m unittest discover -s tests   # the full suite, stdlib only
+python -m custody eval                 # auditor vs. 14 ground-truth fixtures
 python -m custody trial                # 7 adversarial attempts, offline
 python -m custody survey .             # Custody surveys itself
 ```

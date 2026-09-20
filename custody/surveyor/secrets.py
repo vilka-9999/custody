@@ -10,17 +10,18 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import List, Pattern, Tuple
+from re import Pattern
 
-from custody.findings import Finding, Pillar, Severity, finding_id, sort_findings
+from custody.findings import Finding, Pillar, Severity, anchor_ids, sort_findings
 
-SECRET_PATTERNS: List[Tuple[str, Pattern[str], Severity]] = [
+SECRET_PATTERNS: list[tuple[str, Pattern[str], Severity]] = [
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), Severity.CRITICAL),
     ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}"), Severity.CRITICAL),
     ("openai-key", re.compile(r"\bsk-[A-Za-z0-9]{32,}\b"), Severity.CRITICAL),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"), Severity.CRITICAL),
     ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}\b"), Severity.CRITICAL),
-    ("private-key-block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), Severity.CRITICAL),
+    ("private-key-block",
+     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), Severity.CRITICAL),
     ("generic-assigned-secret", re.compile(
         r"(?i)\b(?:api[_-]?key|secret|passwd|password|token)\b\s*[:=]\s*"
         r"['\"][A-Za-z0-9_\-/+]{16,}['\"]"
@@ -40,7 +41,13 @@ PLACEHOLDER_HINTS = (
 )
 
 MAX_SCAN_BYTES = 2_000_000
-"""Files larger than this are skipped; secrets do not live in large binaries."""
+"""Files larger than this are not scanned.
+
+The *caller* enforces this bound and records the file as skipped. An earlier
+version returned an empty list from here, which rendered "not looked" exactly
+like "looked and found nothing" - the precise confusion this project exists
+to prevent.
+"""
 
 
 def redact(value: str) -> str:
@@ -56,16 +63,16 @@ def looks_like_placeholder(value: str) -> bool:
     return any(hint in lowered for hint in PLACEHOLDER_HINTS)
 
 
-def survey_secrets(path: Path, rel: str) -> List[Finding]:
-    """Scan one file for credential patterns."""
-    try:
-        if path.stat().st_size > MAX_SCAN_BYTES:
-            return []
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
+def survey_secrets(path: Path, rel: str) -> list[Finding]:
+    """Scan one file for credential patterns.
 
-    found: List[Finding] = []
+    An unreadable file raises ``OSError`` to the caller, which records it as
+    skipped. Swallowing the error here would report the file as clean without
+    ever having looked at it.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+
+    found: list[Finding] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
         for rule, pattern, severity in SECRET_PATTERNS:
             match = pattern.search(line)
@@ -73,7 +80,7 @@ def survey_secrets(path: Path, rel: str) -> List[Finding]:
                 continue
             found.append(
                 Finding(
-                    id=finding_id(f"secret-{rule}", rel, lineno),
+                    id="",
                     rule=f"secret-{rule}",
                     pillar=Pillar.SECURITY,
                     severity=severity,
@@ -84,4 +91,4 @@ def survey_secrets(path: Path, rel: str) -> List[Finding]:
                     detail={"pattern": rule},
                 )
             )
-    return sort_findings(found)
+    return sort_findings(anchor_ids(found))

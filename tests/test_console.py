@@ -123,6 +123,29 @@ class ServerTests(unittest.TestCase):
             self._get("/../../etc/passwd")
         self.assertEqual(caught.exception.code, 404)
 
+    def test_non_loopback_host_header_is_refused(self) -> None:
+        """A rebinding page's hostname does not read the ledger.
+
+        The bind address is loopback, but DNS rebinding lets a remote page
+        resolve its own hostname to 127.0.0.1; the Host header is the tell.
+        """
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/ledger.json" % self.port,
+            headers={"Host": "evil.example.com"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(caught.exception.code, 403)
+
+    def test_localhost_host_header_is_allowed(self) -> None:
+        """The operator's own browser bar keeps working."""
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/" % self.port,
+            headers={"Host": "localhost:%d" % self.port},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

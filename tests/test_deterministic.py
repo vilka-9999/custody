@@ -57,7 +57,10 @@ class BareExceptTests(unittest.TestCase):
 
     def test_indentation_is_preserved(self) -> None:
         """The replacement keeps the original indentation exactly."""
-        source = "class C:\n    def f(self):\n        try:\n            pass\n        except:\n            pass\n"
+        source = (
+            "class C:\n    def f(self):\n        try:\n"
+            "            pass\n        except:\n            pass\n"
+        )
         fixed = fix_bare_except(source, finding("bare-except", "a.py", 5))
         self.assertIn("        except Exception:", fixed or "")
 

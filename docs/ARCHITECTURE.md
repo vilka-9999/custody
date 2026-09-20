@@ -39,7 +39,7 @@ after the ruling is recorded.
 | `custody/testing.py` | Runs the project's suite; separates *failed* from *never ran*. |
 | `custody/console.py` | Read-only dashboard; surfaces a broken chain. |
 | `custody/trial.py` | The adversarial trial: seven scripted attempts, one honest. |
-| `custody/evaluation.py` | Twelve ground-truth fixtures scoring the auditor. |
+| `custody/evaluation.py` | Fourteen ground-truth fixtures scoring the auditor. |
 
 ## The determinism boundary
 
@@ -73,6 +73,19 @@ would hide it.
 
 Detection is the point, but it only means anything while the evidence is
 beyond the agent's reach.
+
+### Finding identity is content, and clearing takes two signals
+
+A finding's id is derived from the rule, the file, and the *content* of the
+flagged line - never its line number. An earlier line-keyed scheme meant
+inserting one blank line above a finding retired its id: the contracted id
+vanished from a fresh survey and an unfixed finding adjudicated as PROVEN.
+
+Content anchoring alone is not enough either, because a cosmetic edit to the
+flagged line also retires the id without fixing anything. So PROVEN requires
+two independent signals: the contracted id is gone, *and* the count of
+findings of that rule in that file fell. An id that vanished while the count
+held is a finding that was reworded, not repaired.
 
 ### Guards apply to the resolved path, never the spelling
 

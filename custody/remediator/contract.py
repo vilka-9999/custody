@@ -10,11 +10,14 @@ enforces.
 from __future__ import annotations
 
 import fnmatch
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Dict, Iterable, List, Sequence
 
-PROTECTED_GLOBS: List[str] = [
+GLOB_CHARS = frozenset("*?[")
+"""Characters that make a declared path a pattern rather than a name."""
+
+PROTECTED_GLOBS: list[str] = [
     "tests/*",
     "tests/**",
     "**/test_*.py",
@@ -38,7 +41,7 @@ ledger are protected because an agent that can edit its judge or its record is
 not being audited at all.
 """
 
-INTEGRITY_GLOBS: List[str] = [
+INTEGRITY_GLOBS: list[str] = [
     ".custody/*",
     ".custody/**",
     "custody/auditor/*",
@@ -64,7 +67,7 @@ MAX_DECLARED_PATHS = 20
 """An attempt that needs more files than this is too broad to adjudicate."""
 
 
-class ScopeViolation(Exception):
+class ScopeViolationError(Exception):
     """Raised when an attempt declares or touches forbidden territory."""
 
 
@@ -81,13 +84,13 @@ class ScopeContract:
     """
 
     finding_id: str
-    allowed_paths: List[str]
+    allowed_paths: list[str]
     hypothesis: str
     verification: str
     base_sha: str = ""
-    notes: Dict[str, str] = field(default_factory=dict)
+    notes: dict[str, str] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, object]:
+    def to_dict(self) -> dict[str, object]:
         """Return a JSON-serialisable view for the ledger."""
         return {
             "finding_id": self.finding_id,
@@ -110,7 +113,11 @@ def is_repo_relative(path: str) -> bool:
     candidate = path.replace("\\", "/")
     if not candidate or candidate.startswith("/") or candidate.startswith("~"):
         return False
-    if len(candidate) > 1 and candidate[1] == ":":
+    if ":" in candidate:
+        # A colon anywhere is refused, not only at a drive-letter position:
+        # on NTFS, "custody/ledger.py:stream" names an alternate data stream
+        # attached to the protected file, and no repository-relative path a
+        # remediator legitimately writes contains one.
         return False
     return ".." not in PurePosixPath(candidate).parts
 
@@ -158,47 +165,56 @@ def validate_contract(
 ) -> None:
     """Reject a contract that claims authority it may not have.
 
+    Declared paths must be concrete file names, never patterns. A contract
+    that declares ``**`` has named nothing and claimed everything: the
+    declared string matches no protected glob, yet every write it later makes
+    falls inside it, so scope-escape can never fire. "Names the files it may
+    write in advance" means names, not shapes.
+
     Raises:
-        ScopeViolation: If the contract is empty, over-broad, or names a
-            protected path. Rejection happens before the agent runs, so a
-            forbidden declaration costs nothing but a ledger entry.
+        ScopeViolationError: If the contract is empty, over-broad, names a
+            protected path, or declares a wildcard. Rejection happens before
+            the agent runs, so a forbidden declaration costs nothing but a
+            ledger entry.
     """
     if not contract.finding_id:
-        raise ScopeViolation("contract names no finding")
+        raise ScopeViolationError("contract names no finding")
     if not contract.allowed_paths:
-        raise ScopeViolation("contract declares no writable paths")
+        raise ScopeViolationError("contract declares no writable paths")
     if len(contract.allowed_paths) > MAX_DECLARED_PATHS:
-        raise ScopeViolation(
+        raise ScopeViolationError(
             "contract declares %d paths (limit %d)"
             % (len(contract.allowed_paths), MAX_DECLARED_PATHS)
         )
     for path in contract.allowed_paths:
+        if any(char in GLOB_CHARS for char in path):
+            raise ScopeViolationError(f"declared path is a pattern, not a file: {path}")
         if not is_repo_relative(path):
-            raise ScopeViolation("path escapes the repository: %s" % path)
+            raise ScopeViolationError(f"path escapes the repository: {path}")
         if is_protected(path, protected):
-            raise ScopeViolation("path is protected and may not be declared: %s" % path)
+            raise ScopeViolationError(f"path is protected and may not be declared: {path}")
 
 
 def check_scope(
     contract: ScopeContract,
     changed: Iterable[str],
     protected: Sequence[str] = tuple(PROTECTED_GLOBS),
-) -> List[str]:
+) -> list[str]:
     """Return the paths that were written without authority.
 
-    A path is a violation when it is protected, or when it does not match any
-    glob the contract declared. The result is deliberately a list rather than
-    a boolean so the ledger can record exactly what escaped.
+    Declared paths are concrete names, so authority is exact-name equality on
+    the normalised form. ``fnmatch.fnmatch`` was used here once; its case
+    handling follows the host platform, which made the scope-escape detector
+    reach different verdicts on Windows and Linux for the same attempt. The
+    result is deliberately a list rather than a boolean so the ledger can
+    record exactly what escaped.
     """
-    escaped: List[str] = []
+    declared = {normalise(path) for path in contract.allowed_paths}
+    escaped: list[str] = []
     for path in sorted(set(changed)):
         if is_protected(path, protected):
             escaped.append(path)
             continue
-        permitted = any(
-            fnmatch.fnmatch(path, pattern) or path == pattern
-            for pattern in contract.allowed_paths
-        )
-        if not permitted:
+        if normalise(path) not in declared:
             escaped.append(path)
     return escaped

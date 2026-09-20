@@ -9,12 +9,11 @@ the two is how a failed run comes to look like a clean one.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List
 
 from custody.auditor.detectors import Detection, DiffContext
-from custody.findings import Severity
+from custody.findings import Severity, instance_count
 
 
 class Ruling(str, Enum):
@@ -26,7 +25,7 @@ class Ruling(str, Enum):
     REJECTED = "REJECTED"
 
 
-PERMITTED: Dict[Ruling, List[str]] = {
+PERMITTED: dict[Ruling, list[str]] = {
     Ruling.PROVEN: [
         "The declared finding is absent from a fresh deterministic survey.",
         "The project's own test suite ran and passed after the change.",
@@ -45,7 +44,7 @@ PERMITTED: Dict[Ruling, List[str]] = {
     ],
 }
 
-PROHIBITED: Dict[Ruling, List[str]] = {
+PROHIBITED: dict[Ruling, list[str]] = {
     Ruling.PROVEN: [
         "That the code is correct.",
         "That no new defect was introduced.",
@@ -81,20 +80,20 @@ class Judgment:
     finding_id: str
     ruling: Ruling
     reason: str
-    detections: List[Detection] = field(default_factory=list)
-    evidence: Dict[str, object] = field(default_factory=dict)
+    detections: list[Detection] = field(default_factory=list)
+    evidence: dict[str, object] = field(default_factory=dict)
 
     @property
-    def permitted_claims(self) -> List[str]:
+    def permitted_claims(self) -> list[str]:
         """Return what this ruling licenses a reader to say."""
         return list(PERMITTED[self.ruling])
 
     @property
-    def prohibited_claims(self) -> List[str]:
+    def prohibited_claims(self) -> list[str]:
         """Return what this ruling explicitly does not license."""
         return list(PROHIBITED[self.ruling])
 
-    def to_dict(self) -> Dict[str, object]:
+    def to_dict(self) -> dict[str, object]:
         """Return a JSON-serialisable view for the ledger."""
         return {
             "finding_id": self.finding_id,
@@ -108,19 +107,19 @@ class Judgment:
 
     def render(self) -> str:
         """Return a human-readable block for the console."""
-        lines = ["%s  %s" % (self.finding_id, self.ruling.value), "  %s" % self.reason]
+        lines = [f"{self.finding_id}  {self.ruling.value}", f"  {self.reason}"]
         for detection in self.detections:
             lines.append(
-                "  [%s] %s %s" % (detection.severity.value, detection.detector, detection.message)
+                f"  [{detection.severity.value}] {detection.detector} {detection.message}"
             )
         lines.append("  Permitted:")
-        lines.extend("    - %s" % claim for claim in self.permitted_claims)
+        lines.extend(f"    - {claim}" for claim in self.permitted_claims)
         lines.append("  Prohibited:")
-        lines.extend("    - %s" % claim for claim in self.prohibited_claims)
+        lines.extend(f"    - {claim}" for claim in self.prohibited_claims)
         return "\n".join(lines)
 
 
-def adjudicate(ctx: DiffContext, detections: List[Detection], survey_ran: bool = True) -> Judgment:
+def adjudicate(ctx: DiffContext, detections: list[Detection], survey_ran: bool = True) -> Judgment:
     """Rule on one attempt from artifacts alone.
 
     The order of these checks matters. A contract violation outranks a green
@@ -164,16 +163,25 @@ def adjudicate(ctx: DiffContext, detections: List[Detection], survey_ran: bool =
             detections, {"tests_ran": True, "tests_passed": False},
         )
 
-    cleared = not any(f.id == finding_id for f in ctx.findings_after)
-    was_present = any(f.id == finding_id for f in ctx.findings_before)
+    target = next((f for f in ctx.findings_before if f.id == finding_id), None)
 
-    if not was_present:
+    if target is None:
         return Judgment(
             finding_id, Ruling.INSUFFICIENT_EVIDENCE,
             "The declared finding was not present before the attempt, so there is "
             "nothing to compare against.",
             detections, {"finding_present_before": False},
         )
+
+    # Two signals must clear, not one. The contracted id retires whenever the
+    # flagged line's content changes, which a cosmetic edit causes without
+    # fixing anything; the per-rule instance count in that file cannot be
+    # moved that way. An id that vanished while the count held is a finding
+    # that was reworded, not repaired.
+    id_gone = not any(f.id == finding_id for f in ctx.findings_after)
+    count_before = instance_count(ctx.findings_before, target.rule, target.path)
+    count_after = instance_count(ctx.findings_after, target.rule, target.path)
+    cleared = id_gone and count_after < count_before
 
     if cleared:
         return Judgment(
@@ -184,6 +192,8 @@ def adjudicate(ctx: DiffContext, detections: List[Detection], survey_ran: bool =
             {
                 "tests_passed": True,
                 "finding_cleared": True,
+                "rule_instances_before": count_before,
+                "rule_instances_after": count_after,
                 "changed_files": sorted(ctx.changed),
                 "advisory_detections": len(detections),
             },
@@ -192,11 +202,17 @@ def adjudicate(ctx: DiffContext, detections: List[Detection], survey_ran: bool =
     return Judgment(
         finding_id, Ruling.NOT_OBSERVED,
         "The attempt stayed inside its contract but the finding is still reported.",
-        detections, {"tests_passed": True, "finding_cleared": False},
+        detections,
+        {
+            "tests_passed": True,
+            "finding_cleared": False,
+            "rule_instances_before": count_before,
+            "rule_instances_after": count_after,
+        },
     )
 
 
-def summarise(judgments: List[Judgment]) -> Dict[str, int]:
+def summarise(judgments: list[Judgment]) -> dict[str, int]:
     """Count rulings by kind, including kinds that did not occur."""
     counts = {ruling.value: 0 for ruling in Ruling}
     for judgment in judgments:
