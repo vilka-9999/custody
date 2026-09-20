@@ -135,6 +135,34 @@ class PathPredicateTests(unittest.TestCase):
         self.assertTrue(is_integrity_critical("Custody/Ledger.py"))
         self.assertTrue(is_integrity_critical(".CUSTODY/ledger.jsonl"))
 
+    def test_enforcement_machinery_is_integrity_critical(self) -> None:
+        """The guard covers the code that enforces the guard.
+
+        An earlier boundary protected only the auditor and the ledger, so a
+        self-audited agent could legally rewrite the harness, the test
+        runner, the surveyor, or this very glob list - the weakened
+        enforcement took effect on the next run under a green suite.
+        """
+        for path in (
+            "custody/harness.py",
+            "custody/gitio.py",
+            "custody/testing.py",
+            "custody/llm.py",
+            "custody/findings.py",
+            "custody/remediator/contract.py",
+            "custody/surveyor/ast_rules.py",
+        ):
+            self.assertTrue(is_integrity_critical(path), path)
+
+    def test_periphery_stays_remediable(self) -> None:
+        """Components that decide no verdict remain fixable."""
+        for path in (
+            "custody/remediator/deterministic.py",
+            "custody/cli.py",
+            "custody/console.py",
+        ):
+            self.assertFalse(is_integrity_critical(path), path)
+
 
 class LedgerTruncationTests(unittest.TestCase):
     """Dropping the tail of a hash chain leaves a consistent prefix.

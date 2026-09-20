@@ -151,12 +151,15 @@ A remediation attempt may never *declare* authority over tests, CI
 configuration, quality thresholds, the auditor's own source, or the ledger.
 Contracts claiming any of those are rejected before the agent runs.
 
-Two of those are enforced more strictly still. The ledger and the auditor's
-own source are **integrity-critical**: a write to them is refused at the
-filesystem, not merely detected afterwards. Everything else protected — tests,
-CI, thresholds — is deliberately left writable, because preventing the cheat
-would hide it. The agent is allowed to reach for the test file, and is then
-caught and reverted.
+Some of those are enforced more strictly still. The ledger, the auditor, and
+the whole enforcement and evidence core — the harness, the git and test
+runners, the surveyor, the cost accounting, and the contract module that
+defines these boundaries — are **integrity-critical**: a write to them is
+refused at the filesystem, not merely detected afterwards. An agent that can
+edit its judge, its record, or the guard that constrains it is not being
+audited. Everything else protected — tests, CI, thresholds — is deliberately
+left writable, because preventing the cheat would hide it. The agent is
+allowed to reach for the test file, and is then caught and reverted.
 
 That asymmetry is the whole design: detection is the point, but it only means
 anything while the evidence is beyond the agent's reach. Any change that

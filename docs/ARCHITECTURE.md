@@ -62,10 +62,15 @@ input always yields the same answer on replay.
 A contract claiming tests, CI config, quality thresholds, the auditor's source
 or the ledger is rejected before the agent runs.
 
-Two of those go further. `.custody/` and `custody/auditor/` are
-**integrity-critical**: a write is refused at the filesystem, not detected
-afterwards. An agent that can edit the record of its own conduct cannot be
-meaningfully audited.
+Some of those go further. `.custody/`, `custody/auditor/`,
+`custody/surveyor/`, and the enforcement core - the harness, the git and
+test runners, the cost accounting, and the contract module that defines
+these boundaries - are **integrity-critical**: a write is refused at the
+filesystem, not detected afterwards. An agent that can edit the record of
+its own conduct, or the guard that constrains it, cannot be meaningfully
+audited. The remediators, the CLI, and the read-only console stay
+remediable: none of them decides a verdict or produces the evidence one
+rests on.
 
 Everything else protected stays writable *on purpose*. The agent is allowed to
 reach for a test file and is then caught and reverted. Preventing that cheat

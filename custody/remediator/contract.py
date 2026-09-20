@@ -46,7 +46,15 @@ INTEGRITY_GLOBS: list[str] = [
     ".custody/**",
     "custody/auditor/*",
     "custody/auditor/**",
+    "custody/surveyor/*",
+    "custody/surveyor/**",
     "custody/ledger.py",
+    "custody/harness.py",
+    "custody/gitio.py",
+    "custody/testing.py",
+    "custody/llm.py",
+    "custody/findings.py",
+    "custody/remediator/contract.py",
 ]
 """Paths a remediator is *prevented* from writing, not merely caught writing.
 
@@ -55,6 +63,16 @@ allowed to write a test file and is then caught and reverted, which is what
 makes the audit meaningful. These paths are different. An agent that can edit
 the ledger or the auditor can corrupt the evidence of its own conduct, so the
 write itself is refused rather than adjudicated afterwards.
+
+The boundary covers the whole enforcement and evidence core, not only the
+auditor: the harness (which enforces this list), the git and test runners
+(which produce the evidence), the surveyor (whose fresh run decides whether
+a finding cleared), the cost accounting, and this module. An earlier version
+protected only the auditor and the ledger, so in a self-audit an agent could
+legally rewrite the guard that was supposed to constrain it - the edit took
+effect on the next run, checked in under a green suite. The remediators
+themselves, the CLI, and the read-only console stay writable: none of them
+decides a verdict or records the evidence one rests on.
 """
 
 

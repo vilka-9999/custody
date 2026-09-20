@@ -22,10 +22,13 @@ A remediation contract claiming any of these is rejected before the agent
 runs: tests, `.github/`, `pyproject.toml`, `setup.cfg`, `tox.ini`, the
 auditor's own source, and the ledger.
 
-Two of those are enforced more strictly. `.custody/` and `custody/auditor/`
-are **integrity-critical**: a write is refused at the filesystem, not merely
-detected afterwards. An agent that can edit the record of its own conduct
-cannot be meaningfully audited.
+Some of those are enforced more strictly. `.custody/`, `custody/auditor/`,
+`custody/surveyor/`, and the enforcement core (`harness.py`, `gitio.py`,
+`testing.py`, `llm.py`, `findings.py`, `ledger.py`,
+`remediator/contract.py`) are **integrity-critical**: a write is refused at
+the filesystem, not merely detected afterwards. An agent that can edit the
+record of its own conduct - or the guard, runner, or surveyor that produces
+the evidence against it - cannot be meaningfully audited.
 
 Everything else protected stays writable on purpose. The agent is allowed to
 reach for a test file and is then caught and reverted — preventing the cheat
