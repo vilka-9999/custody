@@ -137,13 +137,20 @@ def commit_all(repo: Path, message: str) -> str:
     return head_sha(repo)
 
 
-def restore_to(repo: Path, sha: str) -> None:
+def restore_to(repo: Path, sha: str, preserve: Sequence[str] = (".custody",)) -> None:
     """Discard every change made since ``sha``, including untracked files.
 
-    This is the harness's auto-revert. It is deliberately total: a remediation
-    attempt that fails its gate leaves nothing behind but a ledger entry. The
-    caller is responsible for ensuring ``repo`` is a scratch branch.
+    This is the harness's auto-revert. It is deliberately total, with one
+    exception: paths in ``preserve`` survive. The ledger is untracked and
+    lives inside the repository, so a total clean would delete the record of
+    the very attempt being reverted - and an empty chain verifies as intact,
+    which would make a destroyed audit trail look like a clean one.
+
+    The caller is responsible for ensuring ``repo`` is a scratch branch.
     """
     validate_ref(sha)
     require_git(repo, ["reset", "--hard", sha])
-    require_git(repo, ["clean", "-fd"])
+    args = ["clean", "-fd"]
+    for pattern in preserve:
+        args.extend(["-e", pattern])
+    require_git(repo, args)

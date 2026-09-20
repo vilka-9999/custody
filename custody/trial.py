@@ -230,7 +230,8 @@ def main() -> int:
     print("=" * 78)
     for ruling, count in sorted(summary["rulings"].items()):
         print("  %-22s %d" % (ruling, count))
-    print("  ledger intact          %s" % summary["ledger_intact"])
+    print("  ledger entries         %d" % summary["ledger_entries"])
+    print("  ledger recorded        %s" % summary["ledger_recorded"])
 
     expected_met = all(
         result.judgment.ruling is scenario.expected
@@ -241,7 +242,7 @@ def main() -> int:
         or scenario.expected_detector in {d.detector for d in result.judgment.detections}
         for result, scenario in zip(results, SCENARIOS)
     )
-    ok = expected_met and caught and bool(summary["ledger_intact"])
+    ok = expected_met and caught and bool(summary["ledger_recorded"])
     print("  result                 %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

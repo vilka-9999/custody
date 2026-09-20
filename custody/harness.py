@@ -242,10 +242,16 @@ def summarise_run(results: List[CaseResult], ledger: Ledger) -> Dict[str, object
     counts: Dict[str, int] = {ruling.value: 0 for ruling in Ruling}
     for result in results:
         counts[result.judgment.ruling.value] += 1
+    report = ledger.verify()
+    # An empty chain verifies as intact, so entry count is reported beside it.
+    # A run that adjudicated cases but recorded nothing is a destroyed audit
+    # trail, not a clean result, and must never read as one.
     return {
         "cases": len(results),
         "committed": sum(1 for r in results if r.committed),
         "rulings": counts,
         "spend_usd": ledger.total_cost(),
-        "ledger_intact": ledger.verify().intact,
+        "ledger_intact": report.intact,
+        "ledger_entries": report.entries,
+        "ledger_recorded": report.intact and (report.entries > 0 or not results),
     }

@@ -7,7 +7,9 @@ from pathlib import Path
 
 from custody import gitio
 from custody.auditor.verdict import Ruling
-from custody.harness import HarnessRefusal, _apply, preflight
+from custody.auditor.verdict import Judgment
+from custody.findings import Finding, Pillar, Severity
+from custody.harness import CaseResult, HarnessRefusal, _apply, preflight, summarise_run
 from custody.ledger import Ledger
 from custody.trial import SCENARIOS, run_trial
 
@@ -136,6 +138,49 @@ class AdversarialTrialTests(unittest.TestCase):
         """Seven adversarial attempts leave the chain intact."""
         _, summary = run_trial(verbose=False)
         self.assertTrue(summary["ledger_intact"])
+
+
+class EvidenceSurvivalTests(unittest.TestCase):
+    """The revert must not destroy the record of what it reverted."""
+
+    def test_ledger_survives_a_full_revert(self) -> None:
+        """An untracked ledger is preserved when the tree is reset and cleaned."""
+        root = scratch_repo()
+        base = gitio.head_sha(root)
+        ledger = Ledger(root / ".custody" / "ledger.jsonl")
+        ledger.append("auditor", "case.ruled", target="CUS-1", verdict="REJECTED")
+
+        (root / "app.py").write_text("x = 999\n", encoding="utf-8")
+        (root / "junk.py").write_text("junk\n", encoding="utf-8")
+        gitio.restore_to(root, base)
+
+        self.assertFalse((root / "junk.py").exists())
+        self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "x = 1\n")
+        self.assertEqual(len(list(Ledger(root / ".custody" / "ledger.jsonl").read())), 1)
+
+    def test_empty_ledger_does_not_read_as_a_clean_run(self) -> None:
+        """A destroyed audit trail is not a pass, even though it verifies."""
+        root = Path(tempfile.mkdtemp())
+        ledger = Ledger(root / "ledger.jsonl")
+        self.assertTrue(ledger.verify().intact)
+
+        fake = [
+            CaseResult(
+                finding=Finding("CUS-1", "r", Pillar.QUALITY, Severity.LOW, "a.py", 1, "m"),
+                judgment=Judgment("CUS-1", Ruling.PROVEN, "reason"),
+                committed=True,
+            )
+        ]
+        summary = summarise_run(fake, ledger)
+        self.assertTrue(summary["ledger_intact"])
+        self.assertFalse(summary["ledger_recorded"])
+        self.assertEqual(summary["ledger_entries"], 0)
+
+    def test_trial_records_every_step(self) -> None:
+        """A full trial leaves a substantial, intact record behind."""
+        _, summary = run_trial(verbose=False)
+        self.assertTrue(summary["ledger_recorded"])
+        self.assertGreater(summary["ledger_entries"], 20)
 
 
 if __name__ == "__main__":
