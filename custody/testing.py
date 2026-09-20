@@ -74,9 +74,11 @@ def detect_command(repo: Path) -> list[str] | None:
     missing directory - reported as a suite the agent's change broke, which
     rejected every honest fix the repository received.
     """
-    tests_dir = repo / "tests"
+    tests_dir = next(
+        (repo / name for name in ("tests", "test") if (repo / name).is_dir()), None
+    )
     root_tests = any(repo.glob("test_*.py"))
-    if not tests_dir.is_dir() and not root_tests:
+    if tests_dir is None and not root_tests:
         return None
 
     if shutil.which("pytest") and (repo / "pytest.ini").exists():
@@ -91,7 +93,7 @@ def detect_command(repo: Path) -> list[str] | None:
     if config_mentions_pytest and shutil.which("pytest"):
         return ["pytest", "-q"]
 
-    start = "tests" if tests_dir.is_dir() else "."
+    start = tests_dir.name if tests_dir is not None else "."
     return [sys.executable, "-m", "unittest", "discover", "-s", start, "-q"]
 
 

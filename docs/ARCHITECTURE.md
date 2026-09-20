@@ -33,6 +33,7 @@ after the ruling is recorded.
 | `custody/harness.py` | Preflight, apply, verify, adjudicate, keep or revert. |
 | `custody/auditor/detectors.py` | The seven deterministic reward-hacking detectors. |
 | `custody/auditor/verdict.py` | Rulings and the claims each one licenses. |
+| `custody/auditor/review.py` | Model adjudication of advisory detections; strictly one-way. |
 | `custody/ledger.py` | Hash chain, head marker, offline verification. |
 | `custody/gitio.py` | Argument-list git wrappers; ref validation. |
 | `custody/llm.py` | Stdlib Messages API client with per-call cost accounting. |
@@ -49,7 +50,11 @@ This is the line that answers "where is it agentic versus a fixed pipeline?"
 enforcement, the hash chain, and the deterministic remediator.
 
 **Model-backed:** proposing a fix (`remediator/agent.py`), and adjudicating
-cases the detectors flag as ambiguous.
+the one ambiguous state detection can produce (`auditor/review.py`): a
+deterministically PROVEN ruling that carries advisory detections. The
+reviewer is a one-way ratchet - it can withhold that commit, and can never
+mint one, override a rejection, or silence a detection. Offline, the gap is
+recorded (`review.unavailable`) rather than papered over.
 
 Detection is deterministic on purpose. An accusation that can be reproduced
 by anyone cannot be argued away by a persuasive commit message, and the same
@@ -131,8 +136,11 @@ default.
 6. **Re-survey** — a fresh deterministic run for comparison.
 7. **Detect** — seven deterministic checks over the artifacts.
 8. **Adjudicate** — a ruling, with explicit permitted and prohibited claims.
-9. **Keep or revert** — `PROVEN` commits; everything else is reverted in full
-   and survives only as a ledger entry.
+9. **Review** — only when the ruling is PROVEN *and* advisory detections
+   exist, the model weighs the evidence; an objection withholds the commit
+   and is recorded. Everything the ruling claims stays deterministically true.
+10. **Keep or revert** — `PROVEN` commits (unless withheld); everything else
+    is reverted in full and survives only as a ledger entry.
 
 Every step appends to the ledger before anything is summarised to a human.
 

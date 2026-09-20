@@ -13,6 +13,23 @@ from custody.ledger import Ledger
 from custody.trial import SCENARIOS, run_trial
 
 
+class LineEndingTests(unittest.TestCase):
+    """Proposals land byte-for-byte; the platform must not edit them."""
+
+    def test_apply_does_not_translate_newlines(self) -> None:
+        """An LF proposal stays LF on every platform.
+
+        Default text-mode translation rewrote every line ending of an LF
+        file on Windows - thousands of phantom changes in the diff the
+        auditor reads as evidence, drowning the one real change.
+        """
+        repo = Path(tempfile.mkdtemp())
+        _apply(repo, {"a.py": "x = 1\ny = 2\n"})
+        raw = (repo / "a.py").read_bytes()
+        self.assertNotIn(b"\r\n", raw)
+        self.assertEqual(raw, b"x = 1\ny = 2\n")
+
+
 def scratch_repo(branch: str = "work") -> Path:
     """Create a committed git repository on a non-default branch."""
     root = Path(tempfile.mkdtemp(prefix="custody-test-"))

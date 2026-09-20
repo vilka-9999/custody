@@ -14,6 +14,9 @@ from custody.ledger import Ledger
 from custody.surveyor.runner import survey
 
 if TYPE_CHECKING:
+    from custody.auditor.detectors import DiffContext
+    from custody.auditor.review import ReviewFn, SecondOpinion
+    from custody.auditor.verdict import Judgment
     from custody.harness import CaseResult, Proposal
 
 ProposalFn = Callable[[Path, Finding], "Proposal | None"]
@@ -122,13 +125,17 @@ def _key(finding: Finding) -> tuple[str, str, object]:
     return (finding.rule, finding.path, symbol or finding.line)
 
 
-def _select_remediator(args: argparse.Namespace) -> tuple[str, ProposalFn]:
-    """Choose a remediator and return its name alongside a proposal function.
+def _select_remediator(args: argparse.Namespace) -> tuple[str, ProposalFn, ReviewFn | None]:
+    """Choose a remediator, its proposal function, and the ambiguity reviewer.
 
     Falling back to the deterministic remediator when no key is present is a
     reduction in capability, not a failure, so it is announced rather than
-    silently substituted.
+    silently substituted. The reviewer rides with the key: with a model
+    available, PROVEN rulings that carry advisory detections get a second
+    opinion; offline, that gap in the audit is recorded rather than papered
+    over.
     """
+    from custody.auditor.review import review_with_model
     from custody.remediator import deterministic
     from custody.remediator.agent import available
     from custody.remediator.agent import propose as llm_propose
@@ -137,11 +144,15 @@ def _select_remediator(args: argparse.Namespace) -> tuple[str, ProposalFn]:
         if not args.offline:
             print("ANTHROPIC_API_KEY is not set; using the deterministic remediator.")
             print("It fixes a subset of rules and declines the rest.")
-        return "deterministic", lambda repo, finding: deterministic.propose(repo, finding)
+        return "deterministic", lambda repo, finding: deterministic.propose(repo, finding), None
+
+    def reviewer(ctx: DiffContext, judgment: Judgment) -> SecondOpinion | None:
+        """Adjudicate advisory detections with the run's own model."""
+        return review_with_model(ctx, judgment, model=args.model)
 
     return f"model:{args.model}", lambda repo, finding: llm_propose(
         repo, finding, model=args.model, effort=args.effort
-    )
+    ), reviewer
 
 
 def _obtain_proposal(
@@ -181,6 +192,7 @@ def _run_attempts(
     make_proposal: ProposalFn,
     ledger: Ledger,
     commit: bool,
+    review: ReviewFn | None = None,
 ) -> tuple[list[CaseResult], int, int]:
     """Attempt findings one at a time, re-deriving the queue before each.
 
@@ -222,7 +234,8 @@ def _run_attempts(
             continue
 
         case = run_case(
-            repo, finding, proposal, ledger, base_for_case, current.findings, commit=commit
+            repo, finding, proposal, ledger, base_for_case, current.findings,
+            commit=commit, review=review,
         )
         results.append(case)
         detectors = sorted({d.detector for d in case.judgment.detections})
@@ -235,13 +248,14 @@ def _run_attempts(
 
 def cmd_harden(args: argparse.Namespace) -> int:
     """Run the full loop: propose under contract, verify, adjudicate, keep or revert."""
-    from custody.harness import HarnessRefusalError, preflight, summarise_run
+    from custody.harness import HarnessRefusalError, preflight, summarise_run, verify_baseline
 
     repo = Path(args.repo)
-    remediator_name, make_proposal = _select_remediator(args)
+    remediator_name, make_proposal, review = _select_remediator(args)
 
     try:
         base_sha = preflight(repo, allow_default_branch=args.allow_default_branch)
+        verify_baseline(repo)
     except HarnessRefusalError as exc:
         print(f"refusing to run: {exc}")
         return 1
@@ -270,7 +284,7 @@ def cmd_harden(args: argparse.Namespace) -> int:
     print("")
 
     results, declined, attempts = _run_attempts(
-        repo, args.limit, make_proposal, ledger, commit=not args.dry_run
+        repo, args.limit, make_proposal, ledger, commit=not args.dry_run, review=review
     )
 
     summary = summarise_run(results, ledger)

@@ -14,7 +14,17 @@ about.
 - the working tree has uncommitted changes (Custody's own `.custody/` ledger
   excepted, because merely surveying a repository must not make it ineligible);
 - the checked-out branch is `main`, `master`, `trunk`, or `develop`. Override
-  with `--allow-default-branch` only if you mean it.
+  with `--allow-default-branch` only if you mean it;
+- the project's test suite is already failing. A red baseline would convict
+  every attempt of breakage the agent never caused, so it is refused like a
+  dirty tree. A *missing* suite is different and is recorded per case as
+  INSUFFICIENT_EVIDENCE.
+
+The model's authority is a one-way ratchet everywhere it appears: the
+remediator proposes and never decides, and the reviewer
+(`custody/auditor/review.py`) can only withhold a commit that advisory
+detections cast doubt on - never mint one, never override a rejection,
+never silence a detector.
 
 ### What an agent may never write
 

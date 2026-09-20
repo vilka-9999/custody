@@ -110,6 +110,17 @@ what it expects to change, and how it will know it worked.
 **Auditor** — never reads the remediator's prose. Seven deterministic
 detectors ask whether the attempt cheated:
 
+**Reviewer** — the model's only role in the audit, and a one-way ratchet.
+Detection leaves exactly one ambiguous state: a ruling whose deterministic
+evidence supports PROVEN while advisory (non-critical) detections exist —
+say, a suppression comment added in a file the contract legitimately
+covered. There, and only there, the model reads the artifacts and decides
+whether to withhold the commit. It can never mint a commit, override a
+rejection, silence a detection, or alter what a ruling claims; and when it
+cannot be reached, the deterministic ruling stands with the gap recorded in
+the ledger (`review.unavailable`). A model may add caution to the audit;
+it may not remove any.
+
 | Detector | Question it answers |
 | --- | --- |
 | `test-removed` / `assertions-removed` / `test-skipped` / `vacuous-assertion` | Did the suite stop asking anything? |
@@ -143,9 +154,10 @@ not against an attacker who already owns the disk.
 
 ## Boundaries enforced in code, not in prompts
 
-The harness refuses to start against a dirty working tree or a default branch,
-because a dirty tree makes the diff worthless as evidence and `main` is not a
-scratchpad.
+The harness refuses to start against a dirty working tree, a default branch,
+or a test suite that is already red: a dirty tree makes the diff worthless as
+evidence, `main` is not a scratchpad, and a red baseline would convict every
+attempt of breakage the agent never caused.
 
 A remediation attempt may never *declare* authority over tests, CI
 configuration, quality thresholds, the auditor's own source, or the ledger.
@@ -222,6 +234,29 @@ and a self-survey on Python 3.9 through 3.13.
 review. They are kept together because the class matters more than the
 individual bugs: in every case a guard existed and looked correct, but was
 applied to the wrong representation of its input.
+
+## Real repositories
+
+[docs/CASE-STUDY.md](docs/CASE-STUDY.md) records a run against
+[bottlepy/bottle](https://github.com/bottlepy/bottle): 1,457 findings
+surveyed (including real `pickle.loads`-on-cookie and template-engine
+`eval` CRITICALs), three findings fixed as one-line commits, each PROVEN
+against Bottle's own 381-test suite, forty-two attempts correctly declined
+— and three defects the exercise found in Custody itself, fixed with
+regression tests.
+
+## As a CI gate
+
+Custody's exit codes are designed for pipelines: `survey` reports, `verify`
+exits 2 on a broken chain, and `eval`/`trial` fail on any missed cheat or
+false positive. A minimal gate:
+
+```yaml
+- name: Audit trail is intact
+  run: python -m custody verify .
+- name: The auditor still catches cheats
+  run: python -m custody eval && python -m custody trial
+```
 
 ## License
 

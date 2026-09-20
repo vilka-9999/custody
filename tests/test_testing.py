@@ -57,6 +57,16 @@ class DetectionTests(unittest.TestCase):
         """There is nothing to run, and that is said plainly."""
         self.assertIsNone(detect_command(Path(tempfile.mkdtemp())))
 
+    def test_singular_test_directory_is_recognised(self) -> None:
+        """A ``test/`` directory (bottle, cpython style) is a suite too."""
+        root = Path(tempfile.mkdtemp())
+        (root / "test").mkdir()
+        (root / "test" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "test" / "test_s.py").write_text(PASSING_SUITE, encoding="utf-8")
+        outcome = run_tests(root)
+        self.assertTrue(outcome.ran)
+        self.assertTrue(outcome.passed)
+
     def test_root_level_tests_discover_where_they_live(self) -> None:
         """A repository with test_*.py at the root gets a runnable command.
 
@@ -134,6 +144,20 @@ class OutcomeTests(unittest.TestCase):
         self.assertIn("ran", recorded)
         self.assertIn("passed", recorded)
         self.assertFalse(recorded["ran"])
+
+    def test_red_baseline_is_refused_not_blamed(self) -> None:
+        """A suite that fails before any change poisons every verdict.
+
+        Without this, hardening a repository whose suite was already red
+        rejected every attempt as "the suite failed after the change" -
+        breakage the agent never caused, charged to its account.
+        """
+        from custody.harness import HarnessRefusalError, verify_baseline
+
+        with self.assertRaises(HarnessRefusalError):
+            verify_baseline(repo_with(FAILING_SUITE))
+        verify_baseline(repo_with(PASSING_SUITE))          # green: no refusal
+        verify_baseline(Path(tempfile.mkdtemp()))          # no suite: no refusal
 
     def test_zero_collected_tests_is_not_a_pass(self) -> None:
         """A runner that examined nothing verified nothing.

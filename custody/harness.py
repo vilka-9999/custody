@@ -20,6 +20,7 @@ from pathlib import Path
 
 from custody import gitio
 from custody.auditor.detectors import DiffContext, run_detectors
+from custody.auditor.review import ReviewFn, needs_review
 from custody.auditor.verdict import Judgment, Ruling, adjudicate
 from custody.findings import Finding
 from custody.ledger import Ledger
@@ -99,6 +100,29 @@ def preflight(repo: Path, allow_default_branch: bool = False) -> str:
     return gitio.head_sha(repo)
 
 
+def verify_baseline(repo: Path) -> None:
+    """Refuse to run against a suite that is already red.
+
+    Every attempt is judged by whether the project's own suite passes after
+    the change. A baseline that fails before any agent touches the tree makes
+    that judgment meaningless: every attempt would be rejected for breakage
+    it did not cause. A missing suite is different - it yields
+    INSUFFICIENT_EVIDENCE per case rather than a refusal, because "there is
+    no gate" is a fact worth recording, while "the gate was already red"
+    poisons every verdict.
+
+    Raises:
+        HarnessRefusalError: If the suite ran and failed at baseline.
+    """
+    outcome = run_tests(repo)
+    if outcome.ran and not outcome.passed:
+        raise HarnessRefusalError(
+            "the project's test suite is already failing before any change; "
+            "a red baseline cannot distinguish the agent's breakage from the "
+            "repository's own - fix the suite first"
+        )
+
+
 def _capture(repo: Path, paths: Sequence[str]) -> dict[str, str]:
     """Read the current contents of ``paths``, skipping ones that do not exist."""
     captured: dict[str, str] = {}
@@ -156,7 +180,12 @@ def _apply(repo: Path, files: dict[str, str]) -> tuple[list[str], list[str]]:
             continue
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        # newline="" writes the proposal byte-for-byte. The platform default
+        # translates \n to the OS convention, which on Windows rewrote every
+        # line ending in an LF file - thousands of phantom changes drowning
+        # the one real one in the diff the auditor uses as evidence.
+        with target.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
         written.append(canonical)
 
     return written, refused
@@ -170,8 +199,16 @@ def run_case(
     base_sha: str,
     findings_before: list[Finding],
     commit: bool = True,
+    review: ReviewFn | None = None,
 ) -> CaseResult:
-    """Apply one proposal, verify it, rule on it, and keep or revert it."""
+    """Apply one proposal, verify it, rule on it, and keep or revert it.
+
+    ``review`` is the optional model adjudicator for the one ambiguous state:
+    a PROVEN ruling that carries advisory detections. It is a one-way
+    ratchet - an objection withholds the commit; nothing it returns can
+    override a rejection or upgrade a ruling - and when it is absent or
+    fails, the deterministic ruling stands with the gap recorded.
+    """
     repo = Path(repo)
     ledger.append(
         "harness", "case.opened", target=finding.id,
@@ -204,7 +241,7 @@ def run_case(
     # of anything, but files it wrote surviving un-adjudicated would be worse.
     try:
         return _adjudicate_applied(
-            repo, finding, proposal, ledger, base_sha, findings_before, commit
+            repo, finding, proposal, ledger, base_sha, findings_before, commit, review
         )
     except Exception as exc:
         _abort_case(repo, finding, ledger, base_sha, exc)
@@ -235,6 +272,7 @@ def _adjudicate_applied(
     base_sha: str,
     findings_before: list[Finding],
     commit: bool,
+    review: ReviewFn | None = None,
 ) -> CaseResult:
     """Write, verify, rule on, and keep or revert one validated proposal."""
     before = _capture(repo, list(proposal.files.keys()))
@@ -283,7 +321,28 @@ def _adjudicate_applied(
     detections = run_detectors(context)
     judgment = adjudicate(context, detections, survey_ran=after_survey.complete)
 
-    keep = judgment.ruling is Ruling.PROVEN and commit
+    # The one ambiguous state: deterministically PROVEN, but advisory
+    # detections exist. The reviewer's objection withholds the commit; the
+    # ruling and its claim lists are untouched, because every statement
+    # PROVEN licenses remains deterministically true either way.
+    withheld = False
+    if review is not None and needs_review(judgment):
+        opinion = review(context, judgment)
+        if opinion is None:
+            ledger.append(
+                "auditor", "review.unavailable", target=finding.id,
+                detail={"note": "reviewer unreachable or unreadable; "
+                                "deterministic ruling stands"},
+            )
+        else:
+            ledger.append(
+                "auditor", "review.completed", target=finding.id,
+                detail=opinion.to_dict(), cost_usd=opinion.cost_usd,
+                tokens_in=opinion.tokens_in, tokens_out=opinion.tokens_out,
+            )
+            withheld = opinion.objects
+
+    keep = judgment.ruling is Ruling.PROVEN and commit and not withheld
     sha = ""
     if keep:
         try:
@@ -299,7 +358,8 @@ def _adjudicate_applied(
     )
     ledger.append(
         "harness", "case.closed", target=finding.id,
-        detail={"kept": keep, "sha": sha, "reverted": not keep},
+        detail={"kept": keep, "sha": sha, "reverted": not keep,
+                "withheld_by_review": withheld},
     )
     return CaseResult(finding, judgment, committed=keep, sha=sha)
 
