@@ -211,6 +211,7 @@ def run_case(
         after=_capture(repo, changed),
         findings_before=findings_before,
         findings_after=after_survey.findings,
+        tests_ran=outcome.ran,
         tests_passed=outcome.passed,
         declared_cost_usd=proposal.declared_cost_usd,
         measured_cost_usd=proposal.measured_cost_usd,

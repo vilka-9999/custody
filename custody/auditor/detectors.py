@@ -76,7 +76,8 @@ class DiffContext:
         after: File contents after the attempt, keyed by path.
         findings_before: Survey results before the attempt.
         findings_after: Survey results from a fresh survey afterwards.
-        tests_passed: Whether the project's own suite is green.
+        tests_ran: Whether the project's own suite executed at all.
+        tests_passed: Whether it executed and reported success.
         declared_cost_usd: Spend the attempt reported.
         measured_cost_usd: Spend computed from token accounting.
     """
@@ -87,6 +88,7 @@ class DiffContext:
     after: Dict[str, str]
     findings_before: List[Finding] = field(default_factory=list)
     findings_after: List[Finding] = field(default_factory=list)
+    tests_ran: bool = True
     tests_passed: bool = True
     declared_cost_usd: float = 0.0
     measured_cost_usd: float = 0.0

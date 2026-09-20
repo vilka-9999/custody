@@ -126,11 +126,98 @@ def _select_remediator(args: argparse.Namespace) -> Tuple[str, Callable]:
     )
 
 
-def cmd_harden(args: argparse.Namespace) -> int:
-    """Run the full loop: propose under contract, verify, adjudicate, keep or revert."""
-    from custody.harness import HarnessRefusal, preflight, run_case, summarise_run
+def _obtain_proposal(
+    repo: Path, finding: Finding, make_proposal: Callable, ledger: Ledger
+) -> Optional[object]:
+    """Ask the chosen remediator for a proposal, recording why it declined.
+
+    A decline and a failure are recorded as different events. The first means
+    the remediator judged itself unable to repair this correctly, which is a
+    result; the second means the request itself broke, which is not.
+    """
     from custody.llm import LLMError
     from custody.remediator.agent import ProposalError
+
+    try:
+        proposal = make_proposal(repo, finding)
+    except (ProposalError, LLMError) as exc:
+        ledger.append(
+            "remediator", "proposal.failed", target=finding.id,
+            detail={"error": str(exc), "rule": finding.rule},
+        )
+        print("    proposal failed: %s" % exc)
+        return None
+
+    if proposal is None:
+        ledger.append(
+            "remediator", "proposal.declined", target=finding.id,
+            detail={"reason": "no fixer available for this rule", "rule": finding.rule},
+        )
+        print("    declined (no fixer for this rule)")
+    return proposal
+
+
+def _run_attempts(
+    repo: Path,
+    limit: int,
+    make_proposal: Callable,
+    ledger: Ledger,
+    commit: bool,
+) -> Tuple[List[object], int, int]:
+    """Attempt findings one at a time, re-deriving the queue before each.
+
+    A committed fix shifts the line numbers of everything below it in the same
+    file, so a list surveyed once goes stale after the first commit and later
+    findings silently point at the wrong lines. Re-surveying costs a few
+    milliseconds and keeps every location true at the moment it is acted on.
+
+    Returns:
+        The adjudicated cases, how many findings were declined, and how many
+        attempts were made. All three are reported, because "3 fixed" means
+        something different after 3 attempts than after 30.
+    """
+    from custody.harness import run_case
+
+    results: List[object] = []
+    attempted: set = set()
+    declined = 0
+    attempts = 0
+
+    while attempts < limit:
+        current = survey(repo)
+        if not current.complete:
+            print("survey did not complete mid-run; stopping rather than guessing")
+            break
+        pending = [f for f in sort_findings(current.findings) if _key(f) not in attempted]
+        if not pending:
+            break
+
+        finding = pending[0]
+        attempted.add(_key(finding))
+        attempts += 1
+        base_for_case = gitio.head_sha(repo)
+        print("  %s  %-34s %s" % (finding.id, finding.rule, finding.location()))
+
+        proposal = _obtain_proposal(repo, finding, make_proposal, ledger)
+        if proposal is None:
+            declined += 1
+            continue
+
+        case = run_case(
+            repo, finding, proposal, ledger, base_for_case, current.findings, commit=commit
+        )
+        results.append(case)
+        detectors = sorted({d.detector for d in case.judgment.detections})
+        print("    %-22s %s" % (
+            case.judgment.ruling.value, ", ".join(detectors) or case.judgment.reason
+        ))
+
+    return results, declined, attempts
+
+
+def cmd_harden(args: argparse.Namespace) -> int:
+    """Run the full loop: propose under contract, verify, adjudicate, keep or revert."""
+    from custody.harness import HarnessRefusal, preflight, summarise_run
 
     repo = Path(args.repo)
     remediator_name, make_proposal = _select_remediator(args)
@@ -164,58 +251,9 @@ def cmd_harden(args: argparse.Namespace) -> int:
         print("dry run: nothing will be committed")
     print("")
 
-    results = []
-    declined = 0
-    attempted: set = set()
-    attempts = 0
-
-    # The queue is re-derived before every attempt. A committed fix shifts the
-    # line numbers of everything below it in the same file, so a list surveyed
-    # once goes stale after the first commit and later findings silently point
-    # at the wrong lines. Re-surveying costs a few milliseconds and keeps every
-    # location true at the moment it is acted on.
-    while attempts < args.limit:
-        current = survey(repo)
-        if not current.complete:
-            print("survey did not complete mid-run; stopping rather than guessing")
-            break
-        pending = [f for f in sort_findings(current.findings) if _key(f) not in attempted]
-        if not pending:
-            break
-
-        finding = pending[0]
-        attempted.add(_key(finding))
-        attempts += 1
-        base_for_case = gitio.head_sha(repo)
-        print("  %s  %-34s %s" % (finding.id, finding.rule, finding.location()))
-
-        try:
-            proposal = make_proposal(repo, finding)
-        except (ProposalError, LLMError) as exc:
-            ledger.append(
-                "remediator", "proposal.failed", target=finding.id,
-                detail={"error": str(exc), "rule": finding.rule},
-            )
-            print("    proposal failed: %s" % exc)
-            continue
-        if proposal is None:
-            declined += 1
-            ledger.append(
-                "remediator", "proposal.declined", target=finding.id,
-                detail={"reason": "no fixer available for this rule", "rule": finding.rule},
-            )
-            print("    declined (no fixer for this rule)")
-            continue
-
-        case = run_case(
-            repo, finding, proposal, ledger, base_for_case, current.findings,
-            commit=not args.dry_run,
-        )
-        results.append(case)
-        detectors = sorted({d.detector for d in case.judgment.detections})
-        print("    %-22s %s" % (
-            case.judgment.ruling.value, ", ".join(detectors) or case.judgment.reason
-        ))
+    results, declined, attempts = _run_attempts(
+        repo, args.limit, make_proposal, ledger, commit=not args.dry_run
+    )
 
     summary = summarise_run(results, ledger)
     summary["declined"] = declined

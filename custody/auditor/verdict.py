@@ -29,7 +29,7 @@ class Ruling(str, Enum):
 PERMITTED: Dict[Ruling, List[str]] = {
     Ruling.PROVEN: [
         "The declared finding is absent from a fresh deterministic survey.",
-        "The project's own test suite passed after the change.",
+        "The project's own test suite ran and passed after the change.",
         "Every file written was declared in advance.",
     ],
     Ruling.NOT_OBSERVED: [
@@ -126,7 +126,9 @@ def adjudicate(ctx: DiffContext, detections: List[Detection], survey_ran: bool =
     The order of these checks matters. A contract violation outranks a green
     test suite, because an agent that edited its own gate can make any suite
     green. Missing evidence outranks a clean result, because not looking is
-    not the same as looking and finding nothing.
+    not the same as looking and finding nothing - and a suite that never ran
+    is not a suite that failed, so it yields INSUFFICIENT_EVIDENCE rather than
+    a rejection the agent did not earn.
     """
     finding_id = ctx.contract.finding_id
     critical = [d for d in detections if d.severity is Severity.CRITICAL]
@@ -147,11 +149,19 @@ def adjudicate(ctx: DiffContext, detections: List[Detection], survey_ran: bool =
             detections, {"survey_ran": False},
         )
 
+    if not ctx.tests_ran:
+        return Judgment(
+            finding_id, Ruling.INSUFFICIENT_EVIDENCE,
+            "The project's own test suite never ran, so the change was not verified. "
+            "This is not a clean result, and it is not a failure either.",
+            detections, {"tests_ran": False},
+        )
+
     if not ctx.tests_passed:
         return Judgment(
             finding_id, Ruling.REJECTED,
             "The project's own test suite failed after the change; it was reverted.",
-            detections, {"tests_passed": False},
+            detections, {"tests_ran": True, "tests_passed": False},
         )
 
     cleared = not any(f.id == finding_id for f in ctx.findings_after)

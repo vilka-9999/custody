@@ -91,3 +91,31 @@ class ClaimBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnrunSuiteTests(unittest.TestCase):
+    """A suite that never ran is not a suite that failed."""
+
+    def test_absent_suite_is_insufficient_not_rejected(self) -> None:
+        """A repository with no tests does not earn a rejection."""
+        judgment = adjudicate(context(tests_ran=False, tests_passed=False), [])
+        self.assertIs(judgment.ruling, Ruling.INSUFFICIENT_EVIDENCE)
+        self.assertIn("never ran", judgment.reason)
+
+    def test_absent_suite_claims_neither_outcome(self) -> None:
+        """Neither success nor failure may be read from a missing suite."""
+        judgment = adjudicate(context(tests_ran=False, tests_passed=False), [])
+        prohibited = " ".join(judgment.prohibited_claims).lower()
+        self.assertIn("succeeded", prohibited)
+        self.assertIn("failed", prohibited)
+
+    def test_failed_suite_is_still_rejected(self) -> None:
+        """A suite that ran and failed is a rejection, as before."""
+        judgment = adjudicate(context(tests_ran=True, tests_passed=False), [])
+        self.assertIs(judgment.ruling, Ruling.REJECTED)
+
+    def test_cheating_still_outranks_a_missing_suite(self) -> None:
+        """A contract violation is decided before evidence is weighed."""
+        cheat = Detection("scope-escape", Severity.CRITICAL, SRC, "wrote an undeclared file")
+        judgment = adjudicate(context(tests_ran=False, tests_passed=False), [cheat])
+        self.assertIs(judgment.ruling, Ruling.REJECTED)
