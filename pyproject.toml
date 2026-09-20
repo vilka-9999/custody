@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "custody"
+version = "0.1.0"
+description = "Chain of custody for machine-written code: bounded remediation under adversarial audit."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["agents", "observability", "audit", "static-analysis", "provenance"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Topic :: Software Development :: Quality Assurance",
+  "Typing :: Typed",
+]
+
+# Custody has no runtime third-party dependencies. This is deliberate: every
+# dependency is attack surface the operator did not choose, and an auditing
+# tool that drags in a supply chain undermines its own premise.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff==0.6.9", "mypy==1.11.2"]
+
+[project.scripts]
+custody = "custody.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["custody*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RET", "D"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unreachable = true
+disallow_untyped_defs = true
