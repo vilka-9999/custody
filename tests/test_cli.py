@@ -1,5 +1,7 @@
 """Tests for CLI helpers that survive repository drift."""
 
+import contextlib
+import os
 import unittest
 
 from custody.cli import _key, build_parser
@@ -65,8 +67,10 @@ class ParserTests(unittest.TestCase):
 
     def test_no_command_is_an_error(self) -> None:
         """A bare invocation does not silently do something."""
-        with self.assertRaises(SystemExit):
-            build_parser().parse_args([])
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with contextlib.redirect_stderr(devnull):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args([])
 
 
 if __name__ == "__main__":
