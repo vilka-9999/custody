@@ -396,7 +396,7 @@ def detect_cost_underreport(ctx: DiffContext, tolerance: float = 0.05) -> List[D
         return []
     return [
         Detection(
-            "cost-underreport", Severity.HIGH, "",
+            "cost-underreport", Severity.CRITICAL, "",
             "Declared spend $%.4f is below measured spend $%.4f." % (declared, measured),
             detail={"declared_usd": declared, "measured_usd": measured},
         )

@@ -37,6 +37,28 @@ ledger are protected because an agent that can edit its judge or its record is
 not being audited at all.
 """
 
+INTEGRITY_GLOBS: List[str] = [
+    ".custody/*",
+    ".custody/**",
+    "custody/auditor/*",
+    "custody/auditor/**",
+    "custody/ledger.py",
+]
+"""Paths a remediator is *prevented* from writing, not merely caught writing.
+
+The rest of :data:`PROTECTED_GLOBS` is enforced by detection: the agent is
+allowed to write a test file and is then caught and reverted, which is what
+makes the audit meaningful. These paths are different. An agent that can edit
+the ledger or the auditor can corrupt the evidence of its own conduct, so the
+write itself is refused rather than adjudicated afterwards.
+"""
+
+
+def is_integrity_critical(path: str) -> bool:
+    """Return whether ``path`` may never be written, even to catch the attempt."""
+    return is_protected(path, tuple(INTEGRITY_GLOBS))
+
+
 MAX_DECLARED_PATHS = 20
 """An attempt that needs more files than this is too broad to adjudicate."""
 
