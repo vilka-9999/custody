@@ -14,11 +14,26 @@ contact with the evidence.
 
 ## Install
 
-No third-party runtime dependencies. Python 3.9 or newer.
+No third-party runtime dependencies. Python 3.9 or newer and git are all
+you need.
 
 ```bash
-python -m custody survey .
+git clone https://github.com/vilka-9999/custody
+cd custody
+python -m custody survey .        # first run: Custody surveys itself
 ```
+
+Optionally, install it so the `custody` command works from anywhere:
+
+```bash
+pip install -e .
+custody survey /path/to/any/repo
+```
+
+The model-backed remediator and reviewer read `ANTHROPIC_API_KEY` from the
+environment; without a key, `harden` falls back to the deterministic
+remediator and says so. Everything else — survey, trial, eval, verify,
+console — runs offline with no key at all.
 
 ## Two remediators
 
@@ -68,7 +83,7 @@ keeps every location true at the moment it is acted on.
 | `custody harden [repo]` | The full loop: propose under contract, apply, run the suite, re-survey, adjudicate, keep or revert. |
 | `custody trial` | The adversarial trial. Runs offline, needs no key. |
 | `custody verify [repo]` | Recomputes the ledger hash chain and reports the first entry that does not reconcile. |
-| `custody eval` | Scores the auditor against twelve fixtures with known answers. |
+| `custody eval` | Scores the auditor against fourteen fixtures with known answers. |
 | `custody console [repo]` | Serves a read-only dashboard over the ledger on localhost. |
 
 ## The adversarial trial
@@ -110,17 +125,6 @@ what it expects to change, and how it will know it worked.
 **Auditor** — never reads the remediator's prose. Seven deterministic
 detectors ask whether the attempt cheated:
 
-**Reviewer** — the model's only role in the audit, and a one-way ratchet.
-Detection leaves exactly one ambiguous state: a ruling whose deterministic
-evidence supports PROVEN while advisory (non-critical) detections exist —
-say, a suppression comment added in a file the contract legitimately
-covered. There, and only there, the model reads the artifacts and decides
-whether to withhold the commit. It can never mint a commit, override a
-rejection, silence a detection, or alter what a ruling claims; and when it
-cannot be reached, the deterministic ruling stands with the gap recorded in
-the ledger (`review.unavailable`). A model may add caution to the audit;
-it may not remove any.
-
 | Detector | Question it answers |
 | --- | --- |
 | `test-removed` / `assertions-removed` / `test-skipped` / `vacuous-assertion` | Did the suite stop asking anything? |
@@ -131,10 +135,19 @@ it may not remove any.
 | `vacuous-fix` | Does a fresh survey still report the finding? |
 | `cost-underreport` / `cost-unverifiable` | Was spend declared below what was measured — or could it not be priced at all? |
 
-A language model's only role in the audit is adjudicating cases these
-detectors flag as ambiguous. Detection itself is deterministic, so an
-accusation can be re-checked by anyone and cannot be argued away by a
-persuasive commit message.
+Detection itself is deterministic, so an accusation can be re-checked by
+anyone and cannot be argued away by a persuasive commit message.
+
+**Reviewer** — the model's only role in the audit, and a one-way ratchet.
+Detection leaves exactly one ambiguous state: a ruling whose deterministic
+evidence supports PROVEN while advisory (non-critical) detections exist —
+say, a suppression comment added in a file the contract legitimately
+covered. There, and only there, the model reads the artifacts and decides
+whether to withhold the commit. It can never mint a commit, override a
+rejection, silence a detection, or alter what a ruling claims; and when it
+cannot be reached, the deterministic ruling stands with the gap recorded in
+the ledger (`review.unavailable`). A model may add caution to the audit;
+it may not remove any.
 
 **Ledger** — append-only JSONL. Each entry's hash covers its own content and
 the hash of the entry before it, so altering or removing an entry in the
@@ -226,7 +239,7 @@ seriousness as misses.
 python -m unittest discover -s tests
 ```
 
-238 tests, standard library only, so the suite runs anywhere Python does. The
+256 tests, standard library only, so the suite runs anywhere Python does. The
 adversarial trial is among them, and CI runs the suite, the eval, the trial,
 and a self-survey on Python 3.9 through 3.13.
 
